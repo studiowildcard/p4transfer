@@ -71,6 +71,7 @@ import os.path
 from datetime import datetime
 import logging
 import time
+import math
 
 # Non-standard modules
 import P4
@@ -971,31 +972,45 @@ class P4Source(P4Base):
         self.re_content_translation_failed = re.compile("Translation of file content failed near line 1 file (.*)")
 
     def missingChanges(self, counter):
-        revRange = '//{client}/...@{rev},#head'.format(client=self.P4CLIENT, rev=counter + 1)
-        if sourceTargetTextComparison.sourceP4DVersion > "2017.1":
-            # We can be more efficient with 2017.2 or greater servers with changes -r -m
-            maxChanges = 0
-            if self.options.change_batch_size:
-                maxChanges = self.options.change_batch_size
-            if self.options.maximum and self.options.maximum < maxChanges:
-                maxChanges = self.options.maximum
-            args = ['changes', '-l', '-r']
-            if maxChanges > 0:
-                args.extend(['-m', maxChanges])
-            args.append(revRange)
-            self.logger.debug('reading changes: %s' % args)
-            changes = self.p4cmd(args)
-            self.logger.debug('found %d changes' % len(changes))
-        else:
-            self.logger.debug('reading changes: ', revRange)
-            changes = self.p4cmd('changes', '-l', revRange)
-            self.logger.debug('found %d changes' % len(changes))
-            changes.reverse()
-            if self.options.change_batch_size:
-                changes = changes[:self.options.change_batch_size]
-            if self.options.maximum:
-                changes = changes[:self.options.maximum]
-        self.logger.debug('processing %d changes' % len(changes))
+        success=False
+        maxChanges = 0
+        while not success:
+            try:
+                if sourceTargetTextComparison.sourceP4DVersion > "2017.1":
+                    # We can be more efficient with 2017.2 or greater servers with changes -r -m
+                    if maxChanges == 0:
+                        if self.options.change_batch_size:
+                            maxChanges = self.options.change_batch_size
+                        if self.options.maximum and self.options.maximum < maxChanges:
+                            maxChanges = self.options.maximum
+                        if self.options.max_change_range and self.options.max_change_range < maxChanges:
+                            maxChanges = self.options.max_change_range
+                    revRange = '//{client}/...@{rev},@{rev2}'.format(client=self.P4CLIENT, rev=counter + 1, rev2= counter + maxChanges)
+                    args = ['changes', '-l', '-r']
+                    # if maxChanges > 0:
+                    #     args.extend(['-m', maxChanges])
+                    args.append(revRange)
+                    self.logger.debug('reading changes: %s' % args)
+                    # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 40000000); see 'p4 help maxscanrows'."
+                    changes = self.p4cmd(args)
+                    self.logger.debug('found %d changes' % len(changes))
+                else:
+                    revRange = '//{client}/...@{rev},#head'.format(client=self.P4CLIENT, rev=counter + 1)
+                    self.logger.debug('reading changes: ', revRange)
+                    changes = self.p4cmd('changes', '-l', revRange)
+                    self.logger.debug('found %d changes' % len(changes))
+                    changes.reverse()
+                    if self.options.change_batch_size:
+                        changes = changes[:self.options.change_batch_size]
+                    if self.options.maximum:
+                        changes = changes[:self.options.maximum]
+                self.logger.debug('processing %d changes' % len(changes))
+                success = True
+            except P4.P4Exception as e:
+                re_resubmit = re.compile(r"Too many rows scanned \(over 40000000\); see \'p4 help maxscanrows\'\.")
+                m = re_resubmit.search(e.value)
+                if m:
+                    maxChanges = math.ceil(maxChanges / 2)
         return changes
 
     def abortIfUnsyncableUTF16FilesExist(self, syncCallback, change):
@@ -1320,7 +1335,10 @@ class P4Target(P4Base):
         targFileRevs.extend(movetracker.getMoves())
         result = cc.listsEqual(srcFileRevs, targFileRevs, self.filesToIgnore)
         if not result[0]:
-            raise P4TLogicException(result[1])
+            if "Replication failure: missing elements in target changelist:" in result[1]:
+                self.logger.notify(f"Transfer warning for Target Change {newChangeId}", result[1], include_output=False)
+            else:
+                raise P4TLogicException(result[1])
 
     def syncf(self, localFile):
         self.p4cmd('sync', '-f', localFile)
@@ -1686,6 +1704,8 @@ class P4Target(P4Base):
                         except P4.P4Exception:
                             resolve_result += "\n".join(self.p4.warnings)
                             resolve_result += "\n".join(self.p4.errors)
+                        except IndexError:
+                            self.logger.error(f'Invalid output for p4 resolve: {output} processing {file}')
                         if self.re_resolve_skipped.search(str(resolve_result)):
                             self.logger.warning('Merge from downgraded to edit from due to resolve problems')
                             # Resync source version and then do resolve -ae
@@ -1738,6 +1758,10 @@ class P4Target(P4Base):
         "Set's the counter to specified value"
         self.p4cmd('counter', self.options.counter_name, str(value))
 
+    def getMaxChangeNumber(self, value):
+        "Get the maximum change number for the given depot path"
+        return self.p4cmd(f'changes -m 1 {value}')['change']
+
     def initChangeMapFile(self):
         "Initializes the file - once"
         if not self.options.change_map_file:
@@ -1755,7 +1779,7 @@ class P4Target(P4Base):
             ensureDirectory(os.path.dirname(fpath))
             with open(fpath, "a") as fh:
                 fh.write("sourceP4Port,sourceChangeNo,targetChangeNo\n")
-            output = self.p4cmd('reconcile', fpath)[0]
+            output = self.p4cmd('reconcile', '-I', fpath)[0]
             if output['action'] == 'add':
                 self.p4cmd('reopen', '-t', 'text+CS32', fpath)
         chg = self.p4.fetch_change()
@@ -1874,6 +1898,7 @@ class P4Transfer(object):
         self.options.sleep_on_error_interval = self.getIntOption(GENERAL_SECTION, "sleep_on_error_interval", 60)
         self.options.poll_interval = self.getIntOption(GENERAL_SECTION, "poll_interval", 60)
         self.options.change_batch_size = self.getIntOption(GENERAL_SECTION, "change_batch_size", 1000)
+        self.options.max_change_range = self.getIntOption(GENERAL_SECTION, "max_change_range", 1000)
         self.options.report_interval = self.getIntOption(GENERAL_SECTION, "report_interval", 30)
         self.options.error_report_interval = self.getIntOption(GENERAL_SECTION, "error_report_interval", 30)
         self.options.summary_report_interval = self.getIntOption(GENERAL_SECTION, "summary_report_interval", 10080)
@@ -1972,8 +1997,8 @@ class P4Transfer(object):
                 fcount = fsize = 0
                 if change['change'] in changeSizes:
                     fcount, fsize = changeSizes[change['change']]
-                msg = 'Processing change: {}, files {}, size {} "{}"'.format(
-                            change['change'], fcount, fmtsize(fsize), change['desc'].strip())
+                msg = 'Processing change: {}, files {}, size {}, date {} "{}"'.format(
+                            change['change'], fcount, fmtsize(fsize), time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(change['time']))), change['desc'].strip())
                 self.logger.info(msg)
                 fileRevs, srcFileLogs = self.source.getChange(change['change'])
                 targetChange = self.target.replicateChange(fileRevs, srcFileLogs, change, self.source.p4.port)
@@ -2164,6 +2189,13 @@ class P4Transfer(object):
                     finished = True
                 if num_changes > 0:
                     self.logger.info("Transferred %d changes successfully" % num_changes)
+                else:
+                    self.target.connect('target replicate')
+                    last_counter = self.target.getCounter()
+                    self.target.setCounter(last_counter + self.options.max_change_range)
+                    next_counter = self.target.getCounter()
+                    self.target.disconnect()
+                    self.logger.info(f"0 changes transferred, incremented counter from {last_counter} to {next_counter}")
                 if change_last_summary_sent == 0:
                     change_last_summary_sent = self.previous_target_change_counter
                 if self.options.change_batch_size and num_changes >= self.options.change_batch_size:
@@ -2183,8 +2215,9 @@ class P4Transfer(object):
                     if time.time() - time_last_summary_sent > self.options.summary_report_interval * 60:
                         time_last_summary_sent = time.time()
                         self.send_summary_email(time_last_summary_sent, change_last_summary_sent)
-                    time.sleep(self.options.poll_interval * 60)
-                    self.logger.info("Sleeping for %d minutes" % self.options.poll_interval)
+                    if self.options.poll_interval > 0:
+                        time.sleep(self.options.poll_interval * 60)
+                        self.logger.info("Sleeping for %d minutes" % self.options.poll_interval)
             except P4TException as e:
                 self.log_exception(e)
                 self.logger.notify("Error", "Logic Exception encountered - stopping")
