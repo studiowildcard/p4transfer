@@ -1010,7 +1010,15 @@ class P4Source(P4Base):
                 re_resubmit = re.compile(r"Too many rows scanned \(over 40000000\); see \'p4 help maxscanrows\'\.")
                 m = re_resubmit.search(e.value)
                 if m:
-                    maxChanges = math.ceil(maxChanges / 2)
+                    if maxChanges == 1:
+                        change = self.p4cmd('describe', '-s', counter + 1)[0]
+                        if change['changeType'].startswith('restricted'):
+                            changes = []
+                            self.logger.info(f'Found restricted changelist, skipping: {change.__repr__()}')
+                            success = True
+                    else:                  
+                        self.options.change_batch_size = maxChanges = math.ceil(maxChanges / 2)
+                        self.logger.info(f'Temporarily reducing maxChanges to {maxChanges} due to maxscanrows error.')
         return changes
 
     def abortIfUnsyncableUTF16FilesExist(self, syncCallback, change):
@@ -2192,7 +2200,7 @@ class P4Transfer(object):
                 else:
                     self.target.connect('target replicate')
                     last_counter = self.target.getCounter()
-                    self.target.setCounter(last_counter + self.options.max_change_range)
+                    self.target.setCounter(last_counter + self.options.change_batch_size)
                     next_counter = self.target.getCounter()
                     self.target.disconnect()
                     self.logger.info(f"0 changes transferred, incremented counter from {last_counter} to {next_counter}")
