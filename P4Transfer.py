@@ -983,8 +983,6 @@ class P4Source(P4Base):
                             maxChanges = self.options.change_batch_size
                         if self.options.maximum and self.options.maximum < maxChanges:
                             maxChanges = self.options.maximum
-                        if self.options.max_change_range and self.options.max_change_range < maxChanges:
-                            maxChanges = self.options.max_change_range
                     revRange = '//{client}/...@{rev},@{rev2}'.format(client=self.P4CLIENT, rev=counter + 1, rev2= counter + maxChanges)
                     args = ['changes', '-l', '-r']
                     # if maxChanges > 0:
@@ -1012,9 +1010,10 @@ class P4Source(P4Base):
                 if m:
                     if maxChanges == 1:
                         change = self.p4cmd('describe', '-s', counter + 1)[0]
-                        if change['changeType'].startswith('restricted'):
+                        if change['desc'].startswith('<description: restricted, no permission to view>'):
                             changes = []
-                            self.logger.info(f'Found restricted changelist, skipping: {change.__repr__()}')
+                            # self.logger.info(f'Found restricted changelist, skipping: {change.__repr__()}')
+                            self.logger.notify(f"Found restricted changelist, skipping: {change['change']}", change.__repr__(), include_output=False)
                             success = True
                     else:                  
                         self.options.change_batch_size = maxChanges = math.ceil(maxChanges / 2)
@@ -1906,7 +1905,6 @@ class P4Transfer(object):
         self.options.sleep_on_error_interval = self.getIntOption(GENERAL_SECTION, "sleep_on_error_interval", 60)
         self.options.poll_interval = self.getIntOption(GENERAL_SECTION, "poll_interval", 60)
         self.options.change_batch_size = self.getIntOption(GENERAL_SECTION, "change_batch_size", 1000)
-        self.options.max_change_range = self.getIntOption(GENERAL_SECTION, "max_change_range", 1000)
         self.options.report_interval = self.getIntOption(GENERAL_SECTION, "report_interval", 30)
         self.options.error_report_interval = self.getIntOption(GENERAL_SECTION, "error_report_interval", 30)
         self.options.summary_report_interval = self.getIntOption(GENERAL_SECTION, "summary_report_interval", 10080)
