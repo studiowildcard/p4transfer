@@ -981,12 +981,12 @@ class P4Source(P4Base):
                     if maxChanges == 0:
                         if self.options.change_batch_size:
                             maxChanges = self.options.change_batch_size
-                        if self.options.maximum and self.options.maximum < maxChanges:
-                            maxChanges = self.options.maximum
+                        # if self.options.maximum and self.options.maximum < maxChanges:
+                        #     maxChanges = self.options.maximum
                     revRange = '//{client}/...@{rev},@{rev2}'.format(client=self.P4CLIENT, rev=counter + 1, rev2= counter + maxChanges)
                     args = ['changes', '-l', '-r']
-                    # if maxChanges > 0:
-                    #     args.extend(['-m', maxChanges])
+                    if self.options.maximum:
+                        args.extend(['-m', self.options.maximum])
                     args.append(revRange)
                     self.logger.debug('reading changes: %s' % args)
                     # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 40000000); see 'p4 help maxscanrows'."
@@ -1981,6 +1981,9 @@ class P4Transfer(object):
         self.target.connect('target replicate')
         self.source.createClientWorkspace(True)
         self.target.createClientWorkspace(False, self.source.matchingStreams)
+        args = ['changes', '-m', '1']
+        maxChange = int(self.source.p4cmd(args)[0]['change'])
+        self.logger.info(f"Max Change is {maxChange}")
         changes = self.source.missingChanges(self.target.getCounter())
         if self.options.notransfer:
             self.logger.info("Would transfer %d changes - stopping due to --notransfer" % len(changes))
@@ -2018,7 +2021,7 @@ class P4Transfer(object):
             self.target.submitChangeMap()
         self.source.disconnect()
         self.target.disconnect()
-        return changesTransferred
+        return ( changesTransferred, maxChange )
 
     def log_exception(self, e):
         "Log exceptions appropriately"
@@ -2190,18 +2193,23 @@ class P4Transfer(object):
                 logOnce(self.logger, self.target.options)
                 self.source.disconnect()
                 self.target.disconnect()
-                num_changes = self.replicate_changes()
+                num_changes, max_change = self.replicate_changes()
                 if self.options.notransfer:
                     finished = True
                 if num_changes > 0:
                     self.logger.info("Transferred %d changes successfully" % num_changes)
                 else:
-                    self.target.connect('target replicate')
-                    last_counter = self.target.getCounter()
-                    self.target.setCounter(last_counter + self.options.change_batch_size)
-                    next_counter = self.target.getCounter()
-                    self.target.disconnect()
-                    self.logger.info(f"0 changes transferred, incremented counter from {last_counter} to {next_counter}")
+                    if not self.options.maximum:
+                        self.target.connect('target replicate')
+                        last_counter = self.target.getCounter()
+                        next_counter = last_counter + self.options.change_batch_size
+                        if next_counter <= max_change:
+                            self.target.setCounter(next_counter)
+                            next_counter = self.target.getCounter()
+                            self.logger.info(f"0 changes transferred, incremented counter from {last_counter} to {next_counter}")
+                        else:
+                            self.logger.info(f"0 changes transferred, already reached maximum source change {max_change}")
+                        self.target.disconnect()
                 if change_last_summary_sent == 0:
                     change_last_summary_sent = self.previous_target_change_counter
                 if self.options.change_batch_size and num_changes >= self.options.change_batch_size:
@@ -2250,7 +2258,6 @@ class P4Transfer(object):
         self.logger.notify("Changes transferred", "Completed successfully")
         logging.shutdown()
         return 0
-
 
 if __name__ == '__main__':
     result = 0
