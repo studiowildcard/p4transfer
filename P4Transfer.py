@@ -2253,8 +2253,16 @@ class P4Transfer(object):
                             error_notified = True
                             self.logger.info("Logging - Notifying recurring error")
                             self.logger.notify("Recurring error", "Multiple errors seen")
-                    self.logger.info("Sleeping on error for %d minutes" % self.options.sleep_on_error_interval)
-                    time.sleep(self.options.sleep_on_error_interval * 60)
+                    
+                    # See if there was a connection error
+                    re_connectError = re.compile(r"Connection refused")
+                    m = re_connectError.search(e.value)
+                    if m:
+                        self.logger.info("Connection Error, sleeping for 5 minutes")
+                        time.sleep(300)
+                    else:
+                        self.logger.info("Sleeping on error for %d minutes" % self.options.sleep_on_error_interval)
+                        time.sleep(self.options.sleep_on_error_interval * 60)
         self.logger.notify("Changes transferred", "Completed successfully")
         logging.shutdown()
         return 0
