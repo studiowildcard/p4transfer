@@ -865,8 +865,9 @@ class P4Base(object):
                         if (origTargStream['Type'] != targStream['Type'] and \
                            origTargStream['Parent'] != targStream['Parent']) or \
                            ('Update' not in targStream):  # As in this is a new stream
-                            self.p4.save_stream(targStream)
-                            targStreamsUpdated = True
+                            if (origTargStream['Type'] != 'virtual'):
+                                self.p4.save_stream(targStream)
+                                targStreamsUpdated = True
                 if targStreamsUpdated or (origStream["Type"] != transferStream["Type"] and \
                    origStream["Paths"] != transferStream["Paths"]):
                     self.p4.save_stream(transferStream)
@@ -2007,7 +2008,7 @@ class P4Transfer(object):
                 if change['change'] in changeSizes:
                     fcount, fsize = changeSizes[change['change']]
                 msg = 'Processing change: {}, files {}, size {}, date {} "{}"'.format(
-                            change['change'], fcount, fmtsize(fsize), time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(change['time']))), change['desc'].strip())
+                            change['change'], fcount, fmtsize(fsize), time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(change['time']))), change['desc'].strip()).encode("utf-8")
                 self.logger.info(msg)
                 fileRevs, srcFileLogs = self.source.getChange(change['change'])
                 targetChange = self.target.replicateChange(fileRevs, srcFileLogs, change, self.source.p4.port)
