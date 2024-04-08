@@ -902,13 +902,27 @@ class P4Base(object):
         self.localmap = P4.Map.join(self.clientmap, ctr)
         self.depotmap = self.localmap.reverse()
 
-    def p4cmd(self, *args, **kwargs):
+    def p4cmd(self, *args, max_retries=5, delay=30, **kwargs):
         "Execute p4 cmd while logging arguments and results"
-        self.logger.debug(self.p4id, args)
-        output = self.p4.run(args, **kwargs)
-        self.logger.debug(self.p4id, output)
-        self.checkWarnings()
-        return output
+        retries = 0
+        while retries < max_retries:
+            try:        
+                self.logger.debug(self.p4id, args)
+                output = self.p4.run(args, **kwargs)
+                self.logger.debug(self.p4id, output)
+                self.checkWarnings()
+                return output
+            except P4.P4Exception as e:
+                # Check if the exception is an SSL error
+                if 'SSL' in str(e):  
+                    print(f"SSL connection error encountered: {e}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    retries += 1
+                else:
+                    # If the error is not an SSL error, re-raise the exception
+                    raise     
+        print("Max retries reached. Operation failed.")
+        raise                                
 
     def disconnect(self):
         if self.p4:
