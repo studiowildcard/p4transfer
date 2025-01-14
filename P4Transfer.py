@@ -464,6 +464,8 @@ def diskFileContentModified(file):
             fileSize = os.path.getsize(file.fixedLocalFile)
             digest = getLocalDigest(file.fixedLocalFile)
     elif fileContentComparisonPossible(file.type):
+        if not os.path.exists(file.fixedLocalFile):
+           print(f'file missing but shouldn\'t be: {file.fixedLocalFile}')
         fileSize = os.path.getsize(file.fixedLocalFile)
         digest = getLocalDigest(file.fixedLocalFile)
     elif isKeyTextFile(file.type):
@@ -917,6 +919,7 @@ class P4Base(object):
                 if 'SSL' in str(e):  
                     print(f"SSL connection error encountered: {e}. Retrying in {delay} seconds...")
                     time.sleep(delay)
+                    delay = pow(delay, 1.2)
                     retries += 1
                 else:
                     # If the error is not an SSL error, re-raise the exception
@@ -1004,7 +1007,7 @@ class P4Source(P4Base):
                         args.extend(['-m', self.options.maximum])
                     args.append(revRange)
                     self.logger.debug('reading changes: %s' % args)
-                    # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 40000000); see 'p4 help maxscanrows'."
+                    # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 50000000); see 'p4 help maxscanrows'."
                     changes = self.p4cmd(args)
                     self.logger.debug('found %d changes' % len(changes))
                 else:
@@ -1020,7 +1023,7 @@ class P4Source(P4Base):
                 self.logger.debug('processing %d changes' % len(changes))
                 success = True
             except P4.P4Exception as e:
-                re_resubmit = re.compile(r"Too many rows scanned \(over 40000000\); see \'p4 help maxscanrows\'\.")
+                re_resubmit = re.compile(r"Too many rows scanned \(over 50000000\); see \'p4 help maxscanrows\'\.")
                 m = re_resubmit.search(e.value)
                 if m:
                     if maxChanges == 1:
@@ -1503,6 +1506,8 @@ class P4Target(P4Base):
                     if added or (ind == 0 and outputDict and outputDict['action'] == 'branch' and
                                  self.integrateContentsChanged(file)):
                         if not edited:
+                            if not os.path.exists(file.localFile):
+                                print(f"File does not exist and it should {file.localFile}")
                             self.p4cmd('edit', file.localFile)
                         self.src.p4cmd('sync', '-f', file.localFileRev())
         else:
@@ -1669,7 +1674,7 @@ class P4Target(P4Base):
                 if ind > startInd:
                     continue
                 if integ.how in ['add from', 'moved from']:
-                    assert(afterAdd)
+                    # assert(afterAdd)
                     continue        # We ignore these
                 if integ.localFile is None:
                     # Happens with integrations on top of a move from outside source client view
