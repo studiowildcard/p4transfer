@@ -41,7 +41,8 @@ DESCRIPTION:
         python3 CompareRepos.py -h
 
     The script requires a config file as for P4Transfer.py
-    that provides the Perforce connection information for both servers.
+    The config file provides the Perforce connection information for both servers,
+    and source/target client workspace names.
 
     For full documentation/usage, see project doc:
 
@@ -51,14 +52,31 @@ DESCRIPTION:
 
 import P4
 import os
+import platform
+import re
 import argparse
 import textwrap
+from pathlib import Path
+import shutil
 from ruamel.yaml import YAML
 yaml = YAML()
 
 
 # This is updated based on the value in the config file - used in comparisons below
-caseSensitive = True
+caseSensitiveOS = (platform.system() == "Linux")
+caseSensitiveServer = True  # default - adjusted below in config file
+inconsistentCase = False    # Combo of the above, eg. true => case insensitive servers, but case sensitive OS!
+alreadyEscaped = re.compile(r"%25|%23|%40|%2A")
+
+
+def escapeWildcards(fname):
+    m = alreadyEscaped.findall(fname)
+    if not m:
+        fname = fname.replace("%", "%25")
+        fname = fname.replace("#", "%23")
+        fname = fname.replace("@", "%40")
+        fname = fname.replace("*", "%2A")
+    return fname
 
 
 class FileRev:
@@ -74,7 +92,7 @@ class FileRev:
         self.rev = f['headRev']
         self.change = f['headChange']
         self.type = f['headType']
-        
+
     def __repr__(self):
         return 'depotFile={depotfile} rev={rev} action={action} type={type} size={size} digest={digest}' .format(
             rev=self.rev,
@@ -86,20 +104,26 @@ class FileRev:
         )
 
 
-class RepoComparer():
-    
-    def __init__(self):
+class CompareRepos():
+
+    def __init__(self, *args):
         desc = textwrap.dedent(__doc__)
         parser = argparse.ArgumentParser(
             description=desc,
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="Copyright (C) 2021 Robert Cowham, Perforce Software Ltd"
+            epilog="Copyright (C) 2021-22 Robert Cowham, Perforce Software Ltd"
         )
 
         parser.add_argument('-c', '--config', help="Config file as used by P4Transfer - to read source/target info")
         parser.add_argument('-s', '--source', help="Perforce path for source repo, e.g. //depot/src/...@52342")
-        parser.add_argument('-t', '--target', help="Optional: Perforce path for target repo, e.g. //depot/targ/...@123 [or without rev for #head]. If not specified then assumes --source value with no revision specifier")
-        self.options = parser.parse_args()
+        parser.add_argument('-t', '--target', help="Optional: Perforce path for target repo, e.g. //depot/targ/...@123 " +
+                            "[or without rev for #head]. " +
+                            "If not specified then assumes --source value with revision specifier removed")
+        parser.add_argument('-f', '--fix', action='store_true', help="Fix problems by opening files for required action on target to make src/target the same")
+        if list(args):
+            self.options = parser.parse_args(list(args))
+        else:
+            self.options = parser.parse_args()
 
         if not os.path.exists(self.options.config):
             raise Exception("No config file was specified!")
@@ -116,66 +140,175 @@ class RepoComparer():
         self.srcp4 = P4.P4()
         self.srcp4.port = self.config['source']['p4port']
         self.srcp4.user = self.config['source']['p4user']
+        if self.options.fix:
+            self.srcp4.client = self.config['source']['p4client']
         self.srcp4.connect()
         self.targp4 = P4.P4()
         self.targp4.port = self.config['target']['p4port']
         self.targp4.user = self.config['target']['p4user']
+        if self.options.fix:
+            self.targp4.client = self.config['target']['p4client']
         self.targp4.connect()
-        global caseSensitive
-        caseSensitive = self.config['case_sensitive']
-            
+        global caseSensitiveServer, inconsistentCase
+        caseSensitiveServer = self.config['case_sensitive']
+        # If true we have to adjust things
+        inconsistentCase = caseSensitiveOS and not caseSensitiveServer
+        # Setup for comparing different source/target paths e.g. //srcDepot/... -> //targDepot/...
+        self.srcPath = self.options.source
+        self.targPath = self.options.target
+        if "@" in self.srcPath:
+            parts = self.srcPath.split("@")
+            if len(parts) > 1:
+                self.srcPath = parts[0]
+        if self.srcPath.endswith("/..."):
+            self.srcPath = self.srcPath[0:len(self.srcPath)-3]
+        if self.targPath.endswith("/..."):
+            self.targPath = self.targPath[0:len(self.targPath)-3]
+
     def getFiles(self, fstat):
-        result = {}
+        # Returns 2 lists: depot files and local files
+        # The keys will be lowercase for comparison if we are working with inconsistentCase.
+        # We always retain the case of the client files.
+        depotFiles = {}
+        localFiles = {}
         for f in fstat:
             fname = f['depotFile']
-            if not caseSensitive:
+            if inconsistentCase:
                 fname = fname.lower()
-            result[fname] = FileRev(f)
-        return result
-    
+            depotFiles[fname] = FileRev(f)
+            if 'clientFile' in f:
+                localFiles[fname] = f['clientFile']
+        return depotFiles, localFiles
+
+    def copyLocalFile(self, src, targ):
+        # Copy a file if there is a case path issue - where it might fail an add or edit
+        source_path = Path(src)
+        target_path = Path(targ)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            target_path.chmod(0o644)
+        shutil.copy(source_path, target_path)
+        print(f"Fixed case issue: copied {src} to {targ}")
+
     def run(self):
-        srcFiles = {}
-        targFiles = {}
-        print("Collecting source files")
+        srcDepotFiles = {}
+        targDepotFiles = {}
+        print("Collecting source files: %s" % self.options.source)
         srcFstat = self.srcp4.run_fstat("-Ol", self.options.source)
-        print("Collecting target files")
-        targFstat = self.targp4.run_fstat("-Ol", self.options.target)
-        srcFiles = self.getFiles(srcFstat)    
-        targFiles = self.getFiles(targFstat)
+        # Important to record the file names in local syntax for when source server is case-insensitive and
+        # the local OS is case sensitive!
+        # Then the source depotFile and localFile can differ in case. However when synced, p4 will
+        # at least be case consistent with previous files/directories in the tree.
+        srcLocalHaveFiles = {}
+        if self.options.fix:
+            srcPath = ""
+            if "@" in self.options.source:
+                parts = self.options.source.split("@")
+                if len(parts) > 1:
+                    srcPath = parts[0]
+            haveList = []
+            with self.srcp4.at_exception_level(P4.P4.RAISE_NONE):
+                haveList = self.srcp4.run('have', srcPath)
+            for f in haveList:
+                if inconsistentCase:    # Use the case from source server and don't care about target which is also caseinsensitive
+                    k = f['depotFile']
+                else:
+                    k = f['depotFile'].lower()
+                srcLocalHaveFiles[k] = f['path']
+        print("Collecting target files: %s" % self.options.target)
+        targFstat = []
+        with self.targp4.at_exception_level(P4.P4.RAISE_NONE):
+            targFstat = self.targp4.run_fstat("-Ol", self.options.target)
+        # Note that for inconsistentCase operation, keys to these dicts are lowercase
+        srcDepotFiles, srcLocalFiles = self.getFiles(srcFstat)
+        targDepotFiles, targLocalFiles = self.getFiles(targFstat)
+        targLookupFiles = {}
+        for k, v in targDepotFiles.items():
+            if self.srcPath == self.targPath:
+                targLookupFiles[k] = v
+            else:
+                targLookupFiles[k.replace(self.targPath, self.srcPath)] = v
         missing = []
         deleted = []
         extras = []
         different = []
-        for k, v in srcFiles.items():
-            if 'delete' not in v.action:
-                if k not in targFiles:
+        for k, v in srcDepotFiles.items():
+            if 'delete' not in v.action and v.action != 'purge':
+                if k not in targLookupFiles:
                     missing.append(k)
-                if k in targFiles and 'delete' in targFiles[k].action:
-                    deleted.append((k, targFiles[k].change))
+                    if self.options.fix:
+                        d = v.depotFile
+                        if self.srcPath != self.targPath:
+                            d = d.replace(self.srcPath, self.targPath)
+                        print(f"missing: {k}; {d}")
+                        if k not in srcLocalHaveFiles:  # Otherwise we assume already manually synced
+                            nfile = escapeWildcards(srcLocalFiles[k])
+                            print("src: %s" % self.srcp4.run_sync('-f', "%s#%s" % (nfile, v.rev)))
+                        print(self.targp4.run_add('-ft', v.type, srcLocalFiles[k]))
+                if k in targLookupFiles and 'delete' in targLookupFiles[k].action:
+                    deleted.append((k, targLookupFiles[k].change))
+                    if self.options.fix:
+                        d = v.depotFile
+                        if self.srcPath != self.targPath:
+                            d = d.replace(self.srcPath, self.targPath)
+                        print(f"deleted: {k}; {d}")
+                        print(self.srcp4.run_sync('-f', "%s#%s" % (escapeWildcards(srcLocalFiles[k]), v.rev)))
+                        if inconsistentCase and srcLocalFiles[k] != targLocalFiles[k]:
+                            self.copyLocalFile(srcLocalFiles[k], targLocalFiles[k])
+                        print(self.targp4.run_add('-ft', v.type, srcLocalFiles[k]))
+            if 'delete' not in v.action and v.action != 'purge':
+                if k in targLookupFiles and 'delete' not in targLookupFiles[k].action and v.digest != targLookupFiles[k].digest:
+                    different.append((k, v, targLookupFiles[k]))
+                    if self.options.fix:
+                        d = v.depotFile
+                        if self.srcPath != self.targPath:
+                            d = d.replace(self.srcPath, self.targPath)
+                        print(f"different: {k}; {d}")
+                        with self.targp4.at_exception_level(P4.P4.RAISE_NONE):
+                            print(self.targp4.run_sync("-k", targLocalFiles[k]))
+                        print(self.srcp4.run_sync('-f', "%s#%s" % (escapeWildcards(srcLocalFiles[k]), v.rev)))
+                        if inconsistentCase and srcLocalFiles[k] != targLocalFiles[k]:
+                            self.copyLocalFile(srcLocalFiles[k], targLocalFiles[k])
+                        print(self.targp4.run_edit('-t', v.type, escapeWildcards(srcLocalFiles[k])))
+        for k, v in targLookupFiles.items():
             if 'delete' not in v.action:
-                if k in targFiles and 'delete' not in targFiles[k].action and v.digest != targFiles[k].digest:
-                    different.append((k, v, targFiles[k]))
-        for k, v in targFiles.items():
-            if 'delete' not in v.action:
-                if k not in srcFiles or (k in srcFiles and 'delete' in srcFiles[k].action):
+                if k not in srcDepotFiles or (k in srcDepotFiles and 'delete' in srcDepotFiles[k].action):
                     extras.append(k)
+                    if self.options.fix:
+                        print(f"extra: {targDepotFiles[k].depotFile}; {v.depotFile}")
+                        with self.targp4.at_exception_level(P4.P4.RAISE_NONE):
+                            print(self.targp4.run_sync('-k', escapeWildcards(targLocalFiles[k])))
+                        print(self.targp4.run_delete(escapeWildcards(targLocalFiles[k])))
+        missingCount = deletedCount = extrasCount = differentCount = 0
         if missing:
             print("missing: %s" % "\nmissing: ".join(missing))
+            missingCount = len(missing)
         else:
             print("No-missing")
         if deleted:
             print("deleted: %s" % "\ndeleted: ".join(["%s:%s" % (x[1], x[0]) for x in deleted]))
+            deletedCount = len(deleted)
         else:
             print("No-deleted")
         if extras:
             print("extra: %s" % "\nextra: ".join(extras))
+            extrasCount = len(extras)
         else:
             print("No-extras")
         if different:
             print("different: %s" % "\ndifferent: ".join([x[0] for x in different]))
+            differentCount = len(different)
         else:
             print("No-different")
+        print("""
+Total missing:   %d
+Total deleted:   %d
+Total extras:    %d
+Total different: %d
+Sum Total:       %d
+""" % (missingCount, deletedCount, extrasCount, differentCount, missingCount + deletedCount + extrasCount + differentCount))
+
 
 if __name__ == '__main__':
-    obj = RepoComparer()
+    obj = CompareRepos()
     obj.run()

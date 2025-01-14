@@ -15,7 +15,6 @@ import os
 import shutil
 import stat
 import re
-import glob
 import argparse
 import datetime
 from ruamel.yaml import YAML
@@ -1140,6 +1139,73 @@ class TestFetchTransfer(unittest.TestCase):
 
         filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
         self.assertEqual(filelog[0].revisions[0].action, 'add')
+
+    def testRetainSameChangeNos(self):
+        "Test transfers can be made to keep same change number source and target"
+        self.setupTransfer()
+
+        self.source.p4cmd('counter', '-f', 'change', '10')
+        self.target.p4cmd('configure', 'set', 'lbr.autocompress=1')
+        self.target.p4cmd('counter', '-f', 'change', '10')
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+        create_file(inside_file1, 'Test content')
+        self.source.p4cmd('add', inside_file1)
+        self.source.p4cmd('submit', '-d', "inside_file1 added")
+
+        self.source.p4cmd('edit', inside_file1)
+        append_to_file(inside_file1, 'More content')
+        self.source.p4cmd('submit', '-d', "inside_file1 edited")
+
+        self.run_FetchTransfer()
+
+        changes = self.source.p4cmd('changes', )
+        self.assertEqual(2, len(changes))
+        self.assertEqual('11', changes[1]['change'])
+        self.assertEqual('12', changes[0]['change'])
+
+        changes = self.target.p4cmd('changes', )
+        self.assertEqual(2, len(changes))
+        self.assertEqual('11', changes[1]['change'])
+        self.assertEqual('12', changes[0]['change'])
+
+        self.assertCounters(12, 2)
+
+        self.source.p4cmd('counter', '-f', 'change', '20')
+        self.target.p4cmd('counter', '-f', 'change', '20')
+
+        self.source.p4cmd('delete', inside_file1)
+        self.source.p4cmd('submit', '-d', "inside_file1 deleted")
+
+        self.run_FetchTransfer()
+        self.assertCounters(21, 3)
+
+        changes = self.source.p4cmd('changes', )
+        self.assertEqual(3, len(changes))
+        self.assertEqual('21', changes[0]['change'])
+        changes = self.target.p4cmd('changes', )
+        self.assertEqual(3, len(changes))
+        self.assertEqual('21', changes[0]['change'])
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual('delete', filelog[0].revisions[0].action)
+
+        create_file(inside_file1, 'New content')
+        self.source.p4cmd('add', inside_file1)
+        self.source.p4cmd('submit', '-d', "Re-added")
+
+        self.run_FetchTransfer()
+        self.assertCounters(22, 4)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual(filelog[0].revisions[0].action, 'add')
+
+        changes = self.source.p4cmd('changes', )
+        self.assertEqual(4, len(changes))
+        self.assertEqual('22', changes[0]['change'])
+        changes = self.target.p4cmd('changes', )
+        self.assertEqual(4, len(changes))
+        self.assertEqual('22', changes[0]['change'])
 
     def testFileTypes(self):
         "File types are transferred appropriately"
@@ -2864,7 +2930,7 @@ class TestFetchTransfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "copy from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "moved from")
 
-        # We can't move onto 
+        # We can't move onto
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
         # @pv@ 0 @db.integed@ @//stream/main/file1@ @//stream/main/file3@ 0 1 0 1 10 5
@@ -2928,7 +2994,7 @@ class TestFetchTransfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "moved from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "copy from")
 
-        # We can't move onto 
+        # We can't move onto
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
         # @pv@ 0 @db.integed@ @//stream/main/file1@ @//stream/main/file3@ 0 1 0 1 10 5
@@ -3048,7 +3114,6 @@ class TestFetchTransfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "branch from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "moved from")
 
-
     def testIntegCopyAndRenameAsAddFromOutside(self):
         """Test for integrating a copy and move into single target - when copy is from outside view."""
         self.setupTransfer()
@@ -3089,8 +3154,8 @@ class TestFetchTransfer(unittest.TestCase):
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
 
-        # @pv@ 0 @db.integed@ @//depot/inside/file3@ @//depot/outside/file5@ 1 2 0 1 6 3 
-        # @pv@ 0 @db.integed@ @//depot/outside/file5@ @//depot/inside/file3@ 0 1 1 2 10 3 
+        # @pv@ 0 @db.integed@ @//depot/inside/file3@ @//depot/outside/file5@ 1 2 0 1 6 3
+        # @pv@ 0 @db.integed@ @//depot/outside/file5@ @//depot/inside/file3@ 0 1 1 2 10 3
 
         # Convert copy from -> merged from
         newrecs = []

@@ -57,13 +57,13 @@ DESCRIPTION:
 """
 
 from __future__ import print_function, division
-from os import error
 
 import sys
 import re
 import hashlib
 import stat
 import pprint
+import errno
 from string import Template
 import argparse
 import textwrap
@@ -102,6 +102,24 @@ def logOnce(logger, *args):
 P4.Revision.__repr__ = logrepr
 P4.Integration.__repr__ = logrepr
 P4.DepotFile.__repr__ = logrepr
+# Old to new typemaps
+canonicalTypes = {
+    "xtext":    "text+x",
+    "ktext":    "text+k",
+    "kxtext":   "text+kx",
+    "xbinary":  "binary+x",
+    "ctext":    "text+C",
+    "cxtext":   "text+Cx",
+    "ltext":    "text+F",
+    "xltext":   "text+Fx",
+    "ubinary":  "binary+F",
+    "uxbinary": "binary+Fx",
+    "tempobj":  "binary+FSw",
+    "ctempobj": "binary+Sw",
+    "xtempobj": "binary+FSwx",
+    "xunicode":  "unicode+x",
+    "xutf16":    "utf16+x"
+    }
 
 python3 = sys.version_info[0] >= 3
 if sys.hexversion < 0x02070000 or (0x0300000 <= sys.hexversion < 0x0303000):
@@ -115,7 +133,7 @@ class P4TException(Exception):
     pass
 
 
-class P4TLogicException(Exception):
+class P4TLogicException(P4TException):
     pass
 
 
@@ -360,6 +378,74 @@ class SourceTargetTextComparison(object):
 sourceTargetTextComparison = SourceTargetTextComparison()
 
 
+def specialMovesSupported():
+    # Minor new functionality in 2021.1 (2021.1/2126753)
+    # #2095201 (Job #95658, #101217) **
+    return sourceTargetTextComparison.sourceP4DVersion > "2021.0"
+
+
+class UTCTimeFromSource(object):
+    """Return offset in minutes to be added to source server timestamp to get valid target server timestamp"""
+    utcOffset = 0
+    reDate = re.compile(r"([\+\-]*)([0-9]{2})([0-9]{2})")
+
+    def _getOffsetString(self, server):
+        # Server date: 2015/07/13 14:52:59 -0700 PDT
+        # Server date: 2015/07/13 14:52:59 +0100 BST
+        try:
+            dt = server.p4cmd("info", "-s")[0]["serverDate"]
+            return dt.split()[2]
+        except:
+            return "0000"
+
+    def _getOffsetValue(self, offsetStr):
+        try:
+            m = self.reDate.match(offsetStr)
+            if m:
+                result = int(m.group(2)) * 60 + int(m.group(3))
+                if m.group(1) and m.group(1) == '-':
+                    result = -result
+            return result
+        except:
+            return 0
+
+    def setup(self, src, offsetString=None):
+        if offsetString:
+            srcOffset = offsetString
+        else:
+            srcOffset = self._getOffsetString(src)
+        self.utcOffset = -self._getOffsetValue(srcOffset)
+
+    def offsetMins(self):
+        return self.utcOffset
+
+    def offsetSeconds(self):
+        return self.utcOffset * 60
+
+
+utcTimeFromSource = UTCTimeFromSource()
+
+def stop_file_exists(filepath):
+    """Checks if a stop file exists at the given filepath."""
+    return os.path.exists(filepath)
+STOP_FILE_NAME = "__stopfile"
+STOP_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), STOP_FILE_NAME)
+
+
+def controlled_sleep(minutes):
+    start_time = time.time()
+    end_time = start_time + (minutes * 60)
+    
+    while time.time() < end_time:
+        if stop_file_exists(STOP_FILE_PATH):
+            # Log or print that we detected the stop file and are breaking out of sleep
+            return True  # Indicates sleep was interrupted by stop file
+        time.sleep(30)  # Sleep for 30 seconds before checking again
+
+    return False  # Indicates full sleep was completed without interruption
+
+
+
 def isText(ftype):
     "If filetype is not text - binary or unicode"
     if re.search("text", ftype):
@@ -369,6 +455,19 @@ def isText(ftype):
 
 def isKeyTextFile(ftype):
     return isText(ftype) and "k" in ftype
+
+
+alreadyEscaped = re.compile(r"%25|%23|%40|%2A")
+
+
+def escapeWildCards(fname):
+    m = alreadyEscaped.findall(fname)
+    if not m:
+        fname = fname.replace("%", "%25")
+        fname = fname.replace("#", "%23")
+        fname = fname.replace("@", "%40")
+        fname = fname.replace("*", "%2A")
+    return fname
 
 
 def fileContentComparisonPossible(ftype):
@@ -480,8 +579,14 @@ def diskFileContentModified(file):
             fileSize = os.path.getsize(file.fixedLocalFile)
             digest = getLocalDigest(file.fixedLocalFile)
     elif fileContentComparisonPossible(file.type):
-        fileSize = os.path.getsize(file.fixedLocalFile)
-        digest = getLocalDigest(file.fixedLocalFile)
+        try:
+            fileSize = os.path.getsize(file.fixedLocalFile)
+            digest = getLocalDigest(file.fixedLocalFile)
+        except EnvironmentError as e:
+            if e.errno == errno.ENOENT:
+                return False
+            else:
+                raise
     elif isKeyTextFile(file.type):
         fileSize, digest = getKTextDigest(file.fixedLocalFile)
     return (fileSize, digest.lower()) != (int(file.fileSize), file.digest.lower())
@@ -546,7 +651,7 @@ class ChangeRevision:
 
     def hasIntegrations(self):
         return len(self._integrations)
-    
+
     def deleteIntegrations(self, integsToDelete):
         "Delete specified indexes - which are in reverse order"
         for ind in integsToDelete:
@@ -637,38 +742,9 @@ class ChangeRevision:
 
     def canonicalType(self):
         "Translate between old style type and new canonical type"
-        if self.type == "xtext":
-            return "text+x"
-        elif self.type == "ktext":
-            return "text+k"
-        elif self.type == "kxtext":
-            return "text+kx"
-        elif self.type == "xbinary":
-            return "binary+x"
-        elif self.type == "ctext":
-            return "text+C"
-        elif self.type == "cxtext":
-            return "text+Cx"
-        elif self.type == "ltext":
-            return "text+F"
-        elif self.type == "xltext":
-            return "text+Fx"
-        elif self.type == "ubinary":
-            return "binary+F"
-        elif self.type == "uxbinary":
-            return "binary+Fx"
-        elif self.type == "tempobj":
-            return "binary+FSw"
-        elif self.type == "ctempobj":
-            return "binary+Sw"
-        elif self.type == "xtempobj":
-            return "binary+FSwx"
-        elif self.type == "xunicode":
-            return "unicode+x"
-        elif self.type == "xutf16":
-            return "utf16+x"
-        else:
-            return self.type
+        if self.type in canonicalTypes:
+            return canonicalTypes[self.type]
+        return self.type
 
     def __eq__(self, other, caseSensitive=True):
         "For comparisons between source and target after transfer"
@@ -680,6 +756,10 @@ class ChangeRevision:
                 return False
         # Purge means filetype +Sn - so no comparison possible
         if self.action == 'purge' or other.action == 'purge':
+            return True
+        # Can't compare branches of purged files - content is "purged file" so size 11 with fixed digest!
+        purgedDigest = "08F48C3930677CB9C7F42E5248D560D4"
+        if (self.fileSize == '11' and self.digest == purgedDigest) or (other.fileSize == '11' and other.digest == purgedDigest):
             return True
         if fileContentComparisonPossible(self.type):
             if (self.fileSize, self.digest, self.canonicalType()) != (other.fileSize, other.digest, other.canonicalType()):
@@ -702,7 +782,7 @@ class ChangelistComparer(object):
         srcfiles = set([chRev.localFile for chRev in srclist if chRev.localFile not in filesToIgnore])
         targfiles = set([chRev.localFile for chRev in targlist])
         if not self.caseSensitive:
-            srcfiles = set([x.lower() for x in srcfiles])
+            srcfiles = set([escapeWildCards(x.lower()) for x in srcfiles])
             targfiles = set([x.lower() for x in targfiles])
         diffs = srcfiles.difference(targfiles)
         if diffs:
@@ -714,7 +794,7 @@ class ChangelistComparer(object):
             # Check for no filesize or digest present - indicating "p4 verify -qu" should be run
             new_diffs = [r for r in diffs if r.fileSize and r.digest]
             if not new_diffs:
-                self.logger.debug("Ignoring differences due to lack of fileSize/digest")
+                self.logger.debug("Ignoring differences due to lack of fileSize/digest or purged files")
                 debugDiffs = [r for r in diffs if not r.fileSize or not r.digest]
                 self.logger.debug("Missing deleted elements in target changelist:\n%s" % "\n    ".join([str(r) for r in debugDiffs]))
                 return (True, "")
@@ -725,14 +805,14 @@ class ChangelistComparer(object):
                     chRev.localFile = chRev.localFile.lower()
                 for chRev in targfiles:
                     chRev.localFile = chRev.localFile.lower()
-                new_diffs = [r for r in diffs if  r.fileSize and r.digest]
+                new_diffs = [r for r in diffs if r.fileSize and r.digest]
                 diffs2 = srcfiles.difference(targfiles)
                 if not diffs2:
                     return (True, "")
                 for chRev in targlist:
                     targlookup[chRev.localFile] = chRev
                 # For case insenstive, focus on digest rather than fileSize
-                new_diffs = [r for r in diffs2 if r != targlookup[r.localFile] and r.digest != targlookup[r.localFile].digest]
+                new_diffs = [r for r in diffs2 if r != targlookup[escapeWildCards(r.localFile)] and r.digest != targlookup[escapeWildCards(r.localFile)].digest]
                 if not new_diffs:
                     return (True, "")
                 return (False, "Replication failure (case insensitive): src/target content differences found\nsrc:%s\ntarg:%s" % (
@@ -885,6 +965,7 @@ class P4Base(object):
         self.root = self.options.workspace_root
         clientspec._root = self.root
         clientspec["Options"] = clientspec["Options"].replace("noclobber", "clobber")
+        clientspec["Options"] = clientspec["Options"].replace("normdir", "rmdir")
         clientspec["LineEnd"] = "unix"
         clientspec._view = []
         # We create/update our special target stream, and also create any required target streams that don't exist
@@ -918,12 +999,12 @@ class P4Base(object):
                         targStream['Type'] = v['type']
                         if v['parent']:
                             targStream['Parent'] = v['parent']
-                        if (origTargStream['Type'] != targStream['Type'] and \
+                        if (origTargStream['Type'] != targStream['Type'] and
                            origTargStream['Parent'] != targStream['Parent']) or \
                            ('Update' not in targStream):  # As in this is a new stream
                             self.p4.save_stream(targStream)
                             targStreamsUpdated = True
-                if targStreamsUpdated or (origStream["Type"] != transferStream["Type"] and \
+                if targStreamsUpdated or (origStream["Type"] != transferStream["Type"] and
                    origStream["Paths"] != transferStream["Paths"]):
                     self.p4.save_stream(transferStream)
                 clientspec['Stream'] = self.options.transfer_target_stream
@@ -994,7 +1075,7 @@ class MoveTracker(object):
         self.adds = {}       # Key is depotFile for matching delete
         self.deletes = {}    # Key is depotFile for delete
 
-    def trackAdd(self, chRev, addDepotFile, deleteDepotFile):
+    def trackAdd(self, chRev, deleteDepotFile):
         "Remember the move/add or move/delete so we can match them up"
         assert(deleteDepotFile not in self.adds)
         self.adds[deleteDepotFile] = TrackedAdd(chRev, deleteDepotFile)
@@ -1003,21 +1084,25 @@ class MoveTracker(object):
         "Track a move/delete"
         self.deletes[chRev.depotFile] = chRev
 
-    def getMoves(self):
+    def getMoves(self, msg):
         "Return orphaned moves, or the move/add from add/delete pairs"
+        specialMoves = []
         for depotFile in self.adds:
             if depotFile in self.deletes:
-                self.logger.debug("Matched move add/delete '%s'" % depotFile)
+                self.logger.debug("%s: Matched move add/delete '%s'" % (msg, depotFile))
                 del self.deletes[depotFile]
             else:
-                self.logger.warning("Action move/add changed to add")
-                self.adds[depotFile].chRev.action = "add"
+                self.logger.debug("%s: Action move/add changed to add '%s'" % (msg, depotFile))
+                if specialMovesSupported():
+                    specialMoves.append(self.adds[depotFile].chRev)
+                else:
+                    self.adds[depotFile].chRev.action = "add"
         results = [self.adds[k].chRev for k in self.adds]
         for k in self.deletes:
-            self.logger.debug("Action move/delete changed to delete")
+            self.logger.debug("%s: Action move/delete changed to delete '%s'" % (msg, k))
             self.deletes[k].action = 'delete'
         results.extend([self.deletes[k] for k in self.deletes])
-        return results
+        return results, specialMoves
 
 
 class SyncOutput(P4.OutputHandler):
@@ -1050,7 +1135,7 @@ class P4Source(P4Base):
 
     def __init__(self, section, options):
         super(P4Source, self).__init__(section, options, 'src')
-        self.re_content_translation_failed = re.compile("Translation of file content failed near line 1 file (.*)")
+        self.re_content_translation_failed = re.compile("Translation of file content failed near line [0-9]+ file (.*)")
         self.srcFileLogCache = {}
 
     def missingChanges(self, counter):
@@ -1132,14 +1217,31 @@ class P4Source(P4Base):
                     ))
             chRev.deleteIntegrations(integsToDelete)
 
+    def adjustLocalFileCase(self, fileRevs):
+        """Adjusts case of local files if synced differently"""
+        if self.options.case_sensitive:
+            return
+        haveList = self.p4.run('have', '//{}/...'.format(self.P4CLIENT))
+        localHaveFiles = {}
+        for f in haveList:
+            k = f['depotFile'].lower()
+            localHaveFiles[k] = escapeWildCards(f['path'])
+            # localHaveFiles[k] = f['path']
+        for f in fileRevs:
+            d = f.depotFile.lower()
+            if f.localFile and d in localHaveFiles:
+                if localHaveFiles[d] != f.localFile:
+                    self.logger.debug('LocalCaseChange: %s to %s' % (f.localFile, localHaveFiles[d]))
+                    f.setLocalFile(localHaveFiles[d])
+
     def getChange(self, changeNum):
         """Expects change number as a string, and returns list of filerevs and list of filelog output"""
 
         self.progress.ReportChangeSync()
         change = self.p4cmd('describe', '-s', changeNum)[0]
         fileRevs = []
+        specialMoveRevs = []
         filesToLog = {}
-        branchedFiles = {}
         excludedFiles = []
         movetracker = MoveTracker(self.logger)
         for (n, rev) in enumerate(change['rev']):
@@ -1147,8 +1249,6 @@ class P4Source(P4Base):
             if localFile and len(localFile) > 0:
                 chRev = ChangeRevision(rev, change, n)
                 chRev.setLocalFile(localFile)
-                if chRev.action == 'branch':
-                    branchedFiles[chRev.depotFile] = chRev
                 if chRev.action in ('branch', 'integrate', 'add', 'delete', 'move/add'):
                     filesToLog[chRev.depotFile] = chRev
                 elif chRev.action == 'move/delete':
@@ -1162,7 +1262,8 @@ class P4Source(P4Base):
         fpaths = ['{}#{}'.format(x.depotFile, x.rev) for x in filesToLog.values()]
         filelogs = []
         if fpaths:
-            # Get 2 filelogs per rev
+            processedRevs = {}
+            # Get 2 filelogs per rev - saves time
             filelogs = self.p4.run_filelog('-i', '-m2', *fpaths)
             if len(filelogs) < 1000:
                 self.logger.debug('filelogs: %s' % filelogs)
@@ -1171,6 +1272,9 @@ class P4Source(P4Base):
             for flog in filelogs:
                 if flog.depotFile in filesToLog:
                     chRev = filesToLog[flog.depotFile]
+                    if chRev.depotFile in processedRevs:    # Only process once
+                        continue
+                    processedRevs[chRev.depotFile] = 1
                     revision = flog.revisions[0]
                     if len(revision.integrations) > 0:
                         if not self.options.historical_start_change or revision.change >= self.options.historical_start_change:
@@ -1178,7 +1282,7 @@ class P4Source(P4Base):
                                 if 'from' in integ.how or integ.how == "ignored":
                                     integ.localFile = self.localmap.translate(integ.file)
                                     chRev.addIntegrationInfo(integ)
-                    if chRev.action == 'move/add':
+                    if chRev.action == 'move/add' or (chRev.action == 'add' and chRev.hasMoveIntegrations()):
                         if not chRev.hasIntegrations():
                             # This is move/add with obliterated source
                             fileRevs.append(chRev)
@@ -1188,7 +1292,7 @@ class P4Source(P4Base):
                             for integ in revision.integrations:
                                 if integ.how == 'moved from':
                                     found = True
-                                    movetracker.trackAdd(chRev, flog.depotFile, integ.file)
+                                    movetracker.trackAdd(chRev, integ.file)
                             if not found:
                                 self.logger.warning(u"Failed to find integ record for move/add {}".format(flog.depotFile))
                     else:
@@ -1196,7 +1300,9 @@ class P4Source(P4Base):
                 # else:
                 #     self.logger.error(u"Failed to retrieve filelog for {}#{}".format(flog.depotFile,
                 #                       flog.rev))
-        fileRevs.extend(movetracker.getMoves())
+
+        moveRevs, specialMoveRevs = movetracker.getMoves("getChange")
+        fileRevs.extend(moveRevs)
         syncCallback = SyncOutput(self.p4id, self.logger, self.progress)
         self.p4cmd('sync', '//{}/...@={}'.format(self.P4CLIENT, changeNum), handler=syncCallback)
         for flog in filelogs:
@@ -1204,14 +1310,57 @@ class P4Source(P4Base):
                 chRev = filesToLog[flog.depotFile]
                 chRev.updateDigest()
         self.abortIfUnsyncableUTF16FilesExist(syncCallback, changeNum)  # May raise exception
-        if self.options.historical_start_change: # Extra processing required on integration records
+        self.adjustLocalFileCase(fileRevs)
+        if self.options.historical_start_change:  # Extra processing required on integration records
             self.adjustHistoricalIntegrations(fileRevs)
-        return fileRevs, filelogs
+        if specialMovesSupported():
+            self.processSpecialMoveRevs(fileRevs, specialMoveRevs, filelogs)
+        return fileRevs, specialMoveRevs, filelogs
+
+    def processSpecialMoveRevs(self, fileRevs, specialMoveRevs, filelogs):
+        """Find any moves where move/from has an add - otherwise remove them from the list"""
+        moveDelList = []
+        for moveInd, chRev in enumerate(specialMoveRevs):
+            copyInteg = moveInteg = None
+            chRev.movePartner = None
+            if chRev.numIntegrations() == 2 and chRev.action == "move/add":
+                for _, integ in chRev.integrations():
+                    if integ.how == "moved from":
+                        moveInteg = integ
+                    elif integ.how == "copy from":
+                        copyInteg = integ
+            if not copyInteg or not moveInteg:
+                moveDelList.append(moveInd)
+                continue
+            self.logger.debug("Found potential special move: %s" % chRev.depotFile)
+            # Find a matching rev from fileRevs and attach to this move rev
+            found = -1
+            for n, fRev in enumerate(fileRevs):
+                if fRev.depotFile == moveInteg.file and fRev.numIntegrations() == 1 and fRev._integrations[0].how == "branch from":
+                    found = n
+                    chRev.movePartner = fRev
+                    self.logger.debug("Matched special move to: %s" % fRev.depotFile)
+                    break
+            if found < 0:
+                self.logger.debug("Ignoring potential special move")
+                moveDelList.append(moveInd)
+                continue
+            del fileRevs[found]
+            found = -1
+            for n, fRev in enumerate(fileRevs):
+                if fRev.depotFile == chRev.depotFile:
+                    found = n
+                    break
+            if found >= 0:
+                del fileRevs[found]
+        if moveDelList:
+            # Iterate in reverse to avoid changing the numbers by deleting!
+            for i in reversed(moveDelList):
+                del specialMoveRevs[i]
 
     def getFirstChange(self):
         """Expects change number as a string, and syncs the first historical change"""
-
-        if not self.options.historical_start_change: # Extra processing required on integration records
+        if not self.options.historical_start_change:  # Extra processing required on integration records
             return
         self.progress.ReportChangeSync()
         syncCallback = SyncOutput(self.p4id, self.logger, self.progress)
@@ -1305,12 +1454,18 @@ class P4Target(P4Base):
                 ))
         chRev.deleteIntegrations(integsToDelete)
 
-    def processChangeRevs(self, fileRevs, srcFileLogs):
+    def processChangeRevs(self, fileRevs, specialMoveRevs, srcFileLogs):
         "Process all revisions in the change"
         self.srcFileLogs = {}
         for f in srcFileLogs:
             self.srcFileLogs[f.depotFile] = f
+        numProcessed = 0
         for f in fileRevs:
+            numProcessed += 1
+            if self.options.reset_connection and numProcessed % self.options.reset_connection == 0:
+                self.logger.info("Resetting source connection after %d files processed" % numProcessed)
+                self.src.p4.disconnect()
+                self.src.p4.connect()
             self.logger.debug('targ: %s' % f)
             self.currentFileContent = None
 
@@ -1339,7 +1494,10 @@ class P4Target(P4Base):
                     self.replicateBranch(f, dirty=True)
                 else:
                     self.logger.debug('processing:0020 add')
-                    self.p4cmd('add', '-ft', f.type, f.fixedLocalFile)
+                    output = self.p4cmd('add', '-ft', f.type, f.fixedLocalFile)
+                    if len(output) > 0 and self.re_cant_add_existing_file.search(str(output[-1])):
+                        self.p4cmd('sync', '-k', f.fixedLocalFile)
+                        self.p4cmd('edit', '-t', f.type, f.fixedLocalFile)
             elif f.action == 'delete':
                 if f.hasIntegrations() and not f.hasOnlyMovedFromIntegrations():
                     self.replicateIntegration(f)
@@ -1368,6 +1526,37 @@ class P4Target(P4Base):
                 self.filesToIgnore.append(f.localFile)
             else:
                 raise P4TLogicException('Unknown action: %s for %s' % (f.action, str(f)))
+        for f in specialMoveRevs:  # There won't be any if not supported
+            self.logger.debug('targ: moves %s' % f)
+            # These have to be replayed as something like: p4 copy src/... targ/...
+            # So we create/adjust a specific branch spec and use that.
+            #
+            # Branch Spec:
+            #     //depot/inside/main/file1 //depot/inside/rel/file1
+            #     //depot/inside/main/file2 //depot/inside/rel/file2
+            # 2022-03-03 16:37:29,530:P4Transfer:DEBUG: Found special move: //depot/inside/rel/file2
+            # 2022-03-03 16:37:29,530:P4Transfer:DEBUG: Matched special move to: //depot/inside/rel/file1
+            if f.numIntegrations() != 1 and f._integrations[0].how != "copy from":
+                self.logger.error("Unexpected no of integrations: %d for %s" % (f.numIntegrations(), f.depotFile))
+                continue
+            targFile1 = self.depotmap.translate(f.localFile)
+            srcFile1 = self.depotmap.translate(f._integrations[0].localFile)
+            branchInteg = None
+            for _, integ in f.movePartner.integrations():
+                if integ.how == "branch from":
+                    branchInteg = integ
+                    break
+            if not branchInteg:
+                continue
+            targFile2 = self.depotmap.translate(f.movePartner.localFile)
+            srcFile2 = self.depotmap.translate(branchInteg.localFile)
+            branchName = '_p4transfer_branch'
+            b = self.p4.fetch_branch(branchName)
+            b['View'] = ['"%s" "%s"' % (srcFile1, targFile1),
+                         '"%s" "%s"' % (srcFile2, targFile2)]
+            self.logger.debug('Branch view: %s' % b['View'])
+            self.p4.save_branch(b)
+            self.p4cmd("copy", "-b", branchName)
 
     def fixFileTypes(self, fileRevs, openedFiles):
         """Make sure that all integrated filetypes are correct"""
@@ -1379,15 +1568,24 @@ class P4Target(P4Base):
             if localFile and len(localFile) > 0 and localFile in revDict:
                 chRev = revDict[localFile]
                 if chRev.type != ofile['type']:
-                    self.p4cmd('reopen', '-t', chRev.type, chRev.fixedLocalFile)
+                    # Can't just do a reopen to +l if working with a commit/edge environment
+                    if '+' in chRev.type and 'l' in chRev.type.split('+')[1]:
+                        result = self.p4cmd('reopen', '-t', chRev.type, ofile['depotFile'])
+                        if "can't change +l type with reopen; use revert -k and then edit -t to change type." in str(result):
+                            self.logger.warning(f"Issue identified with file {ofile['depotFile']} suggesting to use 'revert -k' and type change.")
+                            self.p4cmd('revert', '-k', ofile['depotFile'])
+                            self.p4cmd('add', '-t', chRev.type, ofile['depotFile'])
+                            self.p4cmd('edit', '-t', chRev.type, ofile['depotFile'])
+                    else:
+                        self.p4cmd('reopen', '-t', chRev.type, ofile['depotFile'])
 
-    def replicateChange(self, fileRevs, srcFileLogs, change, sourcePort):
+    def replicateChange(self, fileRevs, specialMoveRevs, srcFileLogs, change, sourcePort):
         """This is the heart of it all. Replicate all changes according to their description"""
 
         self.renameOfDeletedFileEncountered = False
         self.resolveDeleteEncountered = False
         self.filesToIgnore = []
-        self.processChangeRevs(fileRevs, srcFileLogs)
+        self.processChangeRevs(fileRevs, specialMoveRevs, srcFileLogs)
         newChangeId = None
 
         openedFiles = self.p4cmd('opened')
@@ -1427,8 +1625,20 @@ class P4Target(P4Base):
                     self.logger.debug("Resyncing out of date files")
                     self.p4.run(cmd)
                     result = self.p4cmd("submit", "-c", m.group(1))
-                else:
-                    raise e
+                else:  # Check for utf16 type problems and change them to binary to see if that works
+                    re_transferProblems = re.compile(".*fix problems then use 'p4 submit -c ([0-9]+)'.\nSome file\(s\) could not be transferred from client")
+                    re_translation = re.compile("Translation of file content failed near line [0-9]+ file (.*)")
+                    m = re_transferProblems.search(self.p4.errors[0])
+                    if not m:
+                        raise e
+                    chgNo = m.group(1)
+                    if self.p4.warnings and re_translation.search(self.p4.warnings[0]):
+                        for w in self.p4.warnings:
+                            mf = re_translation.search(w)
+                            if mf:
+                                self.p4cmd("reopen", "-tbinary", mf.group(1))
+                                self.filesToIgnore.append(mf.group(1))
+                    result = self.p4cmd("submit", "-c", chgNo) # May cause another exception
 
             # the submit information can be followed by refreshFile lines
             # need to go backwards to find submittedChange
@@ -1514,12 +1724,21 @@ class P4Target(P4Base):
                             integ.localFile = self.localmap.translate(integ.file)
                             chRev.addIntegrationInfo(integ)
                             break
-                movetracker.trackAdd(chRev, flog.depotFile, chRev.getIntegration().file)
+                    # Possible that there is a move/add as well as another integration - rare but happens
+                    found = False
+                    for integ in revision.integrations:
+                        if integ.how == 'moved from':
+                            found = True
+                            movetracker.trackAdd(chRev, integ.file)
         cc = ChangelistComparer(self.logger, caseSensitive=self.options.case_sensitive)
-        targFileRevs.extend(movetracker.getMoves())
+        moveRevs, specialMoveRevs = movetracker.getMoves("validate")
+        targFileRevs.extend(moveRevs)
         result = cc.listsEqual(srcFileRevs, targFileRevs, self.filesToIgnore)
         if not result[0]:
-            raise P4TLogicException(result[1])
+            if self.options.ignore_errors:
+                self.logger.error(result[1])
+            else:
+                raise P4TLogicException(result[1])
 
     def syncf(self, localFile):
         self.p4cmd('sync', '-f', localFile)
@@ -1551,7 +1770,7 @@ class P4Target(P4Base):
                 self.p4cmd('sync', source)
                 self.p4cmd('resolve', '-ay', source)
             if os.path.exists(file.fixedLocalFile) or os.path.islink(file.fixedLocalFile):
-                self.p4cmd('move', '-k', source, file.localFile)
+                self.p4cmd('move', '-kf', source, file.localFile)
             else:
                 self.p4cmd('move', source, file.localFile)
             if diskFileContentModified(file):
@@ -1567,7 +1786,7 @@ class P4Target(P4Base):
             return
         newChange = self.p4.fetch_change(newChangeId)
         newChange._user = change['user']
-        # date in change is in epoch time, we need it in canonical form
+        # date in change is in epoch time (from -Ztag changes - not from change -o), we are good to go with UTC if target server is in UTC timezone
         newDate = datetime.utcfromtimestamp(int(change['time'])).strftime("%Y/%m/%d %H:%M:%S")
         newChange._date = newDate
         self.p4.save_change(newChange, '-f')
@@ -1619,7 +1838,7 @@ class P4Target(P4Base):
         # An integration where source has been obliterated will not have integrations
         self.logger.debug('replicateBranch')
         if not self.options.ignore_integrations and not file.hasOnlyIgnoreIntegrations() and \
-            file.hasIntegrations() and file.getIntegration().localFile:
+           file.hasIntegrations() and file.getIntegration().localFile:
             afterAdd = False
             if not self.currentFileContent and os.path.exists(file.fixedLocalFile):
                 self.currentFileContent = readContents(file.fixedLocalFile)
@@ -1648,6 +1867,12 @@ class P4Target(P4Base):
                     # Integrate from same file indicates an undo
                     self.logger.debug('processing:0215 undo')
                     self.p4cmd('undo', "%s#%d" % (file.localFile, file._integrations[ind].erev + 1))
+                    if diskFileContentModified(file):
+                        if file.action == 'add':
+                            self.p4cmd('add', file.localFile)
+                        else:
+                            self.p4cmd('edit', file.localFile)
+                        self.src.p4cmd('sync', '-f', file.localFileRev())
                 else:
                     self.logger.debug('processing:0220 integrate')
                     if dirty or ind > 0:
@@ -1668,7 +1893,7 @@ class P4Target(P4Base):
                         edited = True
                     # Only if last integration to be processed for this rev and it is an add
                     if added or (ind == 0 and outputDict and outputDict['action'] == 'branch' and
-                                 self.integrateContentsChanged(file)):
+                                 self.integrateContentsChanged(file)) or (diskFileContentModified(file)):
                         if not edited:
                             self.p4cmd('edit', file.localFile)
                         self.src.p4cmd('sync', '-f', file.localFileRev())
@@ -1770,7 +1995,7 @@ class P4Target(P4Base):
                 flags.append('-Dt')
             elif self.re_no_revisions_above_that_revision.search(outputStr):
                 # Happens rarely when deletions have occurred. If there are source revs specified we try with one less rev
-                m = re.search("(.*)#(\d+),(\d+)$", srcname)
+                m = re.search("(.*)#([0-9]+),([0-9]+)$", srcname)
                 if m:
                     r1 = int(m.group(2)) - 1
                     r2 = int(m.group(3)) - 1
@@ -1809,7 +2034,7 @@ class P4Target(P4Base):
                 flags.append("-f")
             elif self.re_no_revisions_above_that_revision.search(outputStr):
                 # Happens rarely when deletions have occurred. If there are source revs specified we try with one less rev
-                m = re.search("(.*)#(\d+),(\d+)$", srcname)
+                m = re.search("(.*)#([0-9]+),([0-9]+)$", srcname)
                 if m:
                     r1 = int(m.group(2)) - 1
                     r2 = int(m.group(3)) - 1
@@ -1894,6 +2119,9 @@ class P4Target(P4Base):
                             self.logger.warning('File copied but content changed')
                             self.p4cmd('edit', file.localFile)
                             self.src.p4cmd('sync', '-f', file.localFileRev())
+                        # if afterAdd:
+                        #     self.logger.debug('Redoing add to avoid problems after forced integrate')
+                        #     self.p4cmd('add', '-d', file.localFile)
                     elif integ.how == 'ignored':
                         self.logger.debug('processing:0330 ignored')
                         if 'action' in integResult and integResult['action'] == 'delete':
@@ -1914,7 +2142,8 @@ class P4Target(P4Base):
                         resolve_result = ""
                         try:
                             output = self.p4cmd('resolve', '-am')
-                            resolve_result = output[-1]
+                            if output:
+                                resolve_result = output[-1]
                         except P4.P4Exception:
                             resolve_result += "\n".join(self.p4.warnings)
                             resolve_result += "\n".join(self.p4.errors)
@@ -1925,6 +2154,9 @@ class P4Target(P4Base):
                                 self.p4cmd('revert', file.localFile)
                             self.editFrom(file, self.currentFileContent, afterAdd=afterAdd)
                             editedFrom = True
+                            if afterAdd:
+                                self.logger.debug('Redoing add to avoid problems after forced integrate')
+                                self.p4cmd('add', '-d', file.localFile)
                         elif self.re_resolve_tampered.search(str(resolve_result)):
                             self.p4cmd('edit', file.localFile)
                             self.src.p4cmd('sync', '-f', file.localFileRev())
@@ -1937,6 +2169,9 @@ class P4Target(P4Base):
                             if not afterAdd:
                                 self.p4cmd('revert', file.localFile)
                             self.editFrom(file, self.currentFileContent)
+                            if afterAdd:
+                                self.logger.debug('Redoing add to avoid problems after forced integrate')
+                                self.p4cmd('add', '-d', file.localFile)
                     elif integ.how == 'branch from':
                         self.logger.debug('processing:0355 branch from - interactive -at')
                         self.p4.run_resolve(resolver=EditAcceptTheirs())
@@ -2062,10 +2297,12 @@ class P4Transfer(object):
         parser.add_argument('-n', '--notransfer', action='store_true',
                             help="Validate config file and setup source/target workspaces but don't transfer anything")
         parser.add_argument('-m', '--maximum', default=None, type=int, help="Maximum number of changes to transfer")
+        parser.add_argument('--reset-connection', default=None, type=int, help="No of files after which to reset connection (for large changes)")
         parser.add_argument('-k', '--nokeywords', action='store_true', help="Do not expand keywords and remove +k from filetype")
         parser.add_argument('-r', '--repeat', action='store_true',
                             help="Repeat transfer in a loop - for continuous transfer as background task")
         parser.add_argument('-s', '--stoponerror', action='store_true', help="Stop on any error even if --repeat has been specified")
+        parser.add_argument('--ignore-errors', action='store_true', help="Ignore changelist comparison errors - just log as Error and carry on")
         parser.add_argument('--sample-config', action='store_true', help="Print an example config file and exit")
         parser.add_argument('-i', '--ignore-integrations', action='store_true', help="Treat integrations as adds and edits")
         parser.add_argument('--end-datetime', type=valid_datetime_type, default=None,
@@ -2200,6 +2437,8 @@ class P4Transfer(object):
         "Perform a replication loop"
         self.source.connect('source replicate')
         self.target.connect('target replicate')
+        utcTimeFromSource.setup(self.source)
+        self.logger.info("UTCTimeFromSource offset (mins) %d" % utcTimeFromSource.offsetMins())
         self.source.createClientWorkspace(True)
         self.target.createClientWorkspace(False, self.source.matchingStreams)
         counterVal = self.target.getCounter()
@@ -2238,8 +2477,8 @@ class P4Transfer(object):
                 msg = 'Processing change: {}, files {}, size {} "{}"'.format(
                             change['change'], fcount, fmtsize(fsize), change['desc'].strip())
                 self.logger.info(msg)
-                fileRevs, srcFileLogs = self.source.getChange(change['change'])
-                targetChange = self.target.replicateChange(fileRevs, srcFileLogs, change, self.source.p4.port)
+                fileRevs, specialMoveRevs, srcFileLogs = self.source.getChange(change['change'])
+                targetChange = self.target.replicateChange(fileRevs, specialMoveRevs, srcFileLogs, change, self.source.p4.port)
                 self.target.setCounter(change['change'])
                 self.target.updateChangeMap(self.source.p4.port, change['change'], targetChange)
                 # Tidy up the workspaces after successful transfer
@@ -2410,6 +2649,8 @@ class P4Transfer(object):
         error_notified = False
         finished = False
         num_changes = 0
+        global STOP_FILE_PATH
+        STOP_FILE_PATH = os.path.join(os.path.dirname(self.options.config), STOP_FILE_NAME) # Adjust to same dir as config file.
         while not finished:
             try:
                 self.readConfig()       # Read every time to allow user to change them
@@ -2420,6 +2661,7 @@ class P4Transfer(object):
                     report_interval=self.options.report_interval)
                 logOnce(self.logger, self.source.options)
                 logOnce(self.logger, self.target.options)
+                logOnce(self.logger, "Stopfile: %s" % STOP_FILE_PATH)
                 self.source.disconnect()
                 self.target.disconnect()
                 num_changes = self.replicate_changes()
@@ -2446,8 +2688,12 @@ class P4Transfer(object):
                     if time.time() - time_last_summary_sent > self.options.summary_report_interval * 60:
                         time_last_summary_sent = time.time()
                         self.send_summary_email(time_last_summary_sent, change_last_summary_sent)
-                    time.sleep(self.options.poll_interval * 60)
-                    self.logger.info("Sleeping for %d minutes" % self.options.poll_interval)
+                    # Check if controlled_sleep was interrupted by stop file
+                    if controlled_sleep(self.options.poll_interval):
+                        self.logger.info("Detected stop file. Exiting...")
+                        finished = True
+                    else:
+                        self.logger.info("Sleeping for %d minutes" % self.options.poll_interval)
             except P4TException as e:
                 self.log_exception(e)
                 self.logger.notify("Error", "Logic Exception encountered - stopping")
@@ -2470,7 +2716,7 @@ class P4Transfer(object):
                             self.logger.info("Logging - Notifying recurring error")
                             self.logger.notify("Recurring error", "Multiple errors seen")
                     self.logger.info("Sleeping on error for %d minutes" % self.options.sleep_on_error_interval)
-                    time.sleep(self.options.sleep_on_error_interval * 60)
+                    controlled_sleep(self.options.sleep_on_error_interval)
         self.logger.notify("Changes transferred", "Completed successfully")
         logging.shutdown()
         return 0

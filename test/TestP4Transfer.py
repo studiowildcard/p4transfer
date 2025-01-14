@@ -94,7 +94,7 @@ def getP4ConfigFilename():
 
 
 class P4Server:
-    def __init__(self, root, logger):
+    def __init__(self, root, logger, caseInsensitive=False):
         self.root = root
         self.logger = logger
         self.server_root = os.path.join(root, "server")
@@ -104,8 +104,11 @@ class P4Server:
         ensureDirectory(self.server_root)
         ensureDirectory(self.client_root)
 
+        caseFlag = ""
+        if caseInsensitive:
+            caseFlag = "-C1 "
         self.p4d = P4D
-        self.port = "rsh:%s -r \"%s\" -L log -i" % (self.p4d, self.server_root)
+        self.port = "rsh:%s -r \"%s\" -L log %s -i" % (self.p4d, self.server_root, caseFlag)
         self.p4 = P4.P4()
         self.p4.port = self.port
         self.p4.user = P4USER
@@ -183,7 +186,8 @@ class P4Server:
         return output
 
 
-class TestP4Transfer(unittest.TestCase):
+class TestP4TransferBase(unittest.TestCase):
+    """Base class for tests"""
 
     def __init__(self, methodName='runTest'):
         global saved_stdoutput, test_logger
@@ -193,13 +197,13 @@ class TestP4Transfer(unittest.TestCase):
         else:
             logutils.resetLogger(P4Transfer.LOGGER_NAME)
         self.logger = test_logger
-        super(TestP4Transfer, self).__init__(methodName=methodName)
+        super(TestP4TransferBase, self).__init__(methodName=methodName)
 
     def assertRegex(self, *args, **kwargs):
         if python3:
-            return super(TestP4Transfer, self).assertRegex(*args, **kwargs)
+            return super(TestP4TransferBase, self).assertRegex(*args, **kwargs)
         else:
-            return super(TestP4Transfer, self).assertRegexpMatches(*args, **kwargs)
+            return super(TestP4TransferBase, self).assertRegexpMatches(*args, **kwargs)
 
     def assertContentsEqual(self, expected, content):
         if python3:
@@ -215,15 +219,15 @@ class TestP4Transfer(unittest.TestCase):
         time.sleep(0.1)
         # self.cleanupTestTree()
 
-    def setDirectories(self):
+    def setDirectories(self, caseInsensitive=False):
         self.startdir = os.getcwd()
         self.transfer_root = os.path.join(self.startdir, TEST_ROOT)
         self.cleanupTestTree()
 
         ensureDirectory(self.transfer_root)
 
-        self.source = P4Server(os.path.join(self.transfer_root, 'source'), self.logger)
-        self.target = P4Server(os.path.join(self.transfer_root, 'target'), self.logger)
+        self.source = P4Server(os.path.join(self.transfer_root, 'source'), self.logger, caseInsensitive=caseInsensitive)
+        self.target = P4Server(os.path.join(self.transfer_root, 'target'), self.logger, caseInsensitive=caseInsensitive)
 
         self.transfer_client_root = localDirectory(self.transfer_root, 'transfer_client')
         self.writeP4Config()
@@ -343,6 +347,92 @@ class TestP4Transfer(unittest.TestCase):
         results = [r for r in "\n".join(all_output).split("\n") if re.search("^@pv@", r)]
         return results
 
+
+class TestP4TransferCaseInsensitive(TestP4TransferBase):
+    """Case insensitive version"""
+
+    def __init__(self, methodName='runTest'):
+        global saved_stdoutput, test_logger
+        saved_stdoutput.truncate(0)
+        if test_logger is None:
+            test_logger = logutils.getLogger(P4Transfer.LOGGER_NAME, stream=saved_stdoutput)
+        else:
+            logutils.resetLogger(P4Transfer.LOGGER_NAME)
+        self.logger = test_logger
+        super(TestP4TransferCaseInsensitive, self).__init__(methodName=methodName)
+
+    def setUp(self):
+        self.setDirectories(caseInsensitive=True)
+
+    def testWildcardCharsAndCaseInsensitive(self):
+        "Test filenames containing Perforce wildcards when required to be case insensitive"
+        self.setupTransfer()
+
+        options = self.getDefaultOptions()
+        options["case_sensitive"] = "False"
+        self.createConfigFile(options=options)
+
+        inside = localDirectory(self.source.client_root, "inside")
+        outside = localDirectory(self.source.client_root, "outside")
+        inside_file1 = os.path.join(inside, "@inside_file1")
+        inside_file2 = os.path.join(inside, "%inside_file2")
+        inside_file3 = os.path.join(inside, "#inside_file3")
+        inside_file4 = os.path.join(inside, "C#", "inside_file4")
+        outside_file1 = os.path.join(outside, "%outside_file")
+
+        inside_file1Fixed = inside_file1.replace("@", "%40")
+        inside_file2Fixed = inside_file2.replace("%", "%25")
+        inside_file3Fixed = inside_file3.replace("#", "%23")
+        inside_file4Fixed = inside_file4.replace("#", "%23")
+        outside_file1Fixed = outside_file1.replace("%", "%25")
+
+        create_file(inside_file1, 'Test content')
+        create_file(inside_file3, 'Test content')
+        create_file(inside_file4, 'Test content')
+        create_file(outside_file1, 'Test content')
+        self.source.p4cmd('add', '-f', inside_file1)
+        self.source.p4cmd('add', '-f', inside_file3)
+        self.source.p4cmd('add', '-f', inside_file4)
+        self.source.p4cmd('add', '-f', outside_file1)
+        self.source.p4cmd('submit', '-d', 'files added')
+
+        self.source.p4cmd('integrate', outside_file1Fixed, inside_file2Fixed)
+        self.source.p4cmd('submit', '-d', 'files integrated')
+
+        self.source.p4cmd('edit', inside_file1Fixed)
+        self.source.p4cmd('edit', inside_file3Fixed)
+        self.source.p4cmd('edit', inside_file4Fixed)
+        append_to_file(inside_file1, 'Different stuff')
+        append_to_file(inside_file3, 'Different stuff')
+        append_to_file(inside_file4, 'Different stuff')
+        self.source.p4cmd('submit', '-d', 'files modified')
+
+        self.source.p4cmd('integrate', "//depot/inside/*", "//depot/inside/new/*")
+        self.source.p4cmd('submit', '-d', 'files branched')
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 4)
+
+        files = self.target.p4cmd('files', '//depot/...')
+        self.assertEqual(len(files), 7)
+        self.assertEqual(files[0]['depotFile'], '//depot/import/%23inside_file3')
+        self.assertEqual(files[1]['depotFile'], '//depot/import/%25inside_file2')
+        self.assertEqual(files[2]['depotFile'], '//depot/import/%40inside_file1')
+        self.assertEqual(files[3]['depotFile'], '//depot/import/C%23/inside_file4')
+
+
+class TestP4Transfer(TestP4TransferBase):
+
+    def __init__(self, methodName='runTest'):
+        global saved_stdoutput, test_logger
+        saved_stdoutput.truncate(0)
+        if test_logger is None:
+            test_logger = logutils.getLogger(P4Transfer.LOGGER_NAME, stream=saved_stdoutput)
+        else:
+            logutils.resetLogger(P4Transfer.LOGGER_NAME)
+        self.logger = test_logger
+        super(TestP4Transfer, self).__init__(methodName=methodName)
+
     def testArgParsing(self):
         "Basic argparsing for the module"
         self.setupTransfer()
@@ -373,6 +463,22 @@ class TestP4Transfer(unittest.TestCase):
         self.assertFalse(pt.options.stoponerror)
         self.assertEqual(datetime.datetime(2040, 1, 1, 13, 1), pt.options.end_datetime)
         self.assertFalse(pt.endDatetimeExceeded())
+
+    def testTimeOffset(self):
+        "Basic timeoffset calculations"
+        obj = P4Transfer.UTCTimeFromSource()
+        tests = [
+            # src        result (UTC - src)
+            ["0000",     0],
+            ["asfd",     0],
+            ["-0100",    60],
+            ["+0100",   -60],
+            ["-0700",    420],
+            ["+0700",   -420],
+        ]
+        for t in tests:
+            obj.setup(None, t[0])
+            self.assertEqual(obj.offsetMins(), t[1])
 
     def testMaximum(self):
         "Test  only max number of changes are transferred"
@@ -945,6 +1051,7 @@ class TestP4Transfer(unittest.TestCase):
         self.run_P4Transfer()
         self.assertCounters(1, 1)
 
+    @unittest.skip("P4 now seems able to sync this file!")
     def testUTF16Unsyncable(self):
         "UTF 16 file which can't be synced"
         self.setupTransfer()
@@ -1187,6 +1294,67 @@ class TestP4Transfer(unittest.TestCase):
             content = content.decode()
         lines = content.split("\n")
         self.assertEqual(lines[0], '$Id: //depot/import/inside_file2#1 $')
+
+    def testFileTypesPlusL(self):
+        "File types are transferred appropriately even when exclusive locked"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+        create_file(inside_file1, "Test content")
+        self.source.p4cmd('add', '-tbinary', inside_file1)
+        self.source.p4cmd('submit', '-d', "inside_file1 added")
+
+        self.run_P4Transfer()
+        self.assertCounters(1, 1)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual(filelog[0].revisions[0].type, 'binary')
+
+        self.source.p4cmd('edit', '-t+l', inside_file1)
+        append_to_file(inside_file1, "More content")
+        self.source.p4cmd('submit', '-d', "Type changed")
+
+        self.run_P4Transfer()
+        self.assertCounters(2, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertTrue(filelog[0].revisions[0].type in ['binary+l'])
+
+    def testFileTypesPlusLCommit(self):
+        "File types are transferred appropriately even when exclusive locked on a commit-server"
+        self.setupTransfer()
+
+        # Change target to a commit server
+        self.target.p4cmd('serverid', 'mycommit')
+        svr = self.target.p4.fetch_server('mycommit')
+        svr['Services'] = 'commit-server'
+        self.target.p4.save_server(svr)
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+        inside_file2 = os.path.join(inside, "inside_file2")
+        create_file(inside_file1, "Test content")
+        self.source.p4cmd('add', '-ttext', inside_file1)
+        self.source.p4cmd('submit', '-d', "inside_file1 added")
+
+        self.run_P4Transfer()
+        self.assertCounters(1, 1)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual(filelog[0].revisions[0].type, 'text')
+
+        self.source.p4cmd('edit', inside_file1)
+        self.source.p4cmd('move', inside_file1, inside_file2)
+        self.source.p4cmd('reopen', '-tbinary+l', inside_file2)
+        # append_to_file(inside_file1, "More content")
+        self.source.p4cmd('submit', '-d', "Type changed")
+
+        self.run_P4Transfer()
+        self.assertCounters(2, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file2')
+        self.assertEqual(filelog[0].revisions[0].type, 'binary+l')
 
     def testFileTypeIntegrations(self):
         "File types are integrated appropriately"
@@ -1483,6 +1651,46 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual("copy from", filelog[0].revisions[0].integrations[0].how)
         self.assertEqual("moved from", filelog[0].revisions[0].integrations[1].how)
 
+    def testMoveCopyIgnoreCombo(self):
+        """Test for Move where the add also has a copy and an ignore"""
+        self.setupTransfer()
+        inside = localDirectory(self.source.client_root, "inside")
+        original_file = os.path.join(inside, 'original', 'original_file')
+        renamed_file = os.path.join(inside, 'new', 'new_file')
+        file2 = os.path.join(inside, 'new', 'file2')
+        file3 = os.path.join(inside, 'new', 'file3')
+        create_file(original_file, "Some content\n")
+        create_file(file2, "Other content\n")
+        create_file(file3, "Some Other content\n")
+        self.source.p4cmd('add', original_file, file2, file3)
+        self.source.p4cmd('submit', '-d', "adding original files")
+
+        self.source.p4cmd('edit', original_file)
+        append_to_file(original_file, 'More\n')
+        self.source.p4cmd('submit', '-d', "editing original file")
+
+        self.source.p4cmd('edit', original_file)
+        self.source.p4cmd('move', original_file, renamed_file)
+        self.source.p4cmd('integ', file3, renamed_file)
+        self.source.p4cmd('resolve', '-ay', renamed_file)
+        self.source.p4cmd('integ', file2, renamed_file)
+        self.source.p4cmd('resolve', '-at', renamed_file)
+        self.source.p4cmd('submit', '-d', "rename/copy/ignore file")
+
+        self.run_P4Transfer()
+        self.assertCounters(3, 3)
+
+        change = self.target.p4.run_describe('3')[0]
+        self.assertEqual(2, len(change['depotFile']))
+        self.assertEqual('//depot/import/new/new_file', change['depotFile'][0])
+        self.assertEqual('//depot/import/original/original_file', change['depotFile'][1])
+        self.assertEqual('move/add', change['action'][0])
+        self.assertEqual('move/delete', change['action'][1])
+        filelog = self.target.p4.run_filelog('//depot/import/new/new_file')
+        self.assertEqual(3, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("copy from", filelog[0].revisions[0].integrations[0].how)
+        self.assertEqual("ignored", filelog[0].revisions[0].integrations[1].how)
+        self.assertEqual("moved from", filelog[0].revisions[0].integrations[2].how)
 
     def testOldStyleMove(self):
         """Old style move - a branch and delete"""
@@ -1732,6 +1940,35 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(len(change['depotFile']), 1)
         self.assertEqual(change['depotFile'][0], '//depot/import/branch/new_file')
         self.assertEqual(change['action'][0], 'branch')
+
+    def testMoveAndIntegrate(self):
+        """Test for Move with a merge - requires add -d"""
+        self.setupTransfer()
+        inside = localDirectory(self.source.client_root, "inside")
+
+        original_file = os.path.join(inside, 'original', 'original_file')
+        renamed_file = os.path.join(inside, 'new', 'new_file')
+        other_file = os.path.join(inside, 'branch', 'new_file')
+        create_file(original_file, "Some content")
+        create_file(other_file, "Some content\nnew")
+        self.source.p4cmd('add', original_file, other_file)
+        self.source.p4cmd('submit', '-d', "adding original and other file")
+
+        self.source.p4cmd('edit', original_file)
+        self.source.p4cmd('move', original_file, renamed_file)
+        self.source.p4cmd('integ', '-f', other_file, renamed_file)
+        self.source.p4cmd('resolve', '-am', renamed_file)
+        self.source.p4cmd('submit', '-d', "renaming file")
+
+        self.run_P4Transfer()
+        self.assertCounters(2, 2)
+
+        change = self.target.p4.run_describe('2')[0]
+        self.assertEqual(len(change['depotFile']), 2)
+        self.assertEqual(change['depotFile'][0], '//depot/import/new/new_file')
+        self.assertEqual(change['depotFile'][1], '//depot/import/original/original_file')
+        self.assertEqual(change['action'][0], 'move/add')
+        self.assertEqual(change['action'][1], 'move/delete')
 
     def testUndo(self):
         "Simple undo of add/edit"
@@ -2316,20 +2553,20 @@ class TestP4Transfer(unittest.TestCase):
         "Historical integration where target has extra revs so wrong one is picked"
         self.setupTransfer()
 
-        _ = self.source.p4.fetch_change() # Create change no
+        _ = self.source.p4.fetch_change()  # Create change no
         # In HistoricalStart mode we don't start from first change
         config = self.getDefaultOptions()
         config['historical_start_change'] = '2'
         self.createConfigFile(options=config)
         self.setTargetCounter('1')
-        
+
         inside = localDirectory(self.source.client_root, "inside")
         timport = localDirectory(self.target.client_root, "import")
         file1 = os.path.join(inside, "file1")
         file2 = os.path.join(inside, "file2")
         tfile1 = os.path.join(timport, "file1")
         tfile2 = os.path.join(timport, "file2")
-        
+
         create_file(file1, "Test content\n")
         create_file(tfile1, "Test targ content\n")
 
@@ -3490,6 +3727,85 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[1].how, "ignored")
         self.assertEqual(filelog.revisions[0].integrations[2].how, "ignored")
 
+    # Only works for p4d.21.1 or later
+    def testIntegAndRenamePrevious(self):
+        """Test for copying while renaming older file."""
+        self.setupTransfer()
+
+        # $ p4 describe -s 19027676 | grep Square.png
+        # ... //UE5/RES/Tut/Square.png#2 branch
+        # ... //UE5/RES/GuidedTut/Square.png#1 move/add
+
+        # //UE5/Main/Tut/Square.png
+        # ... #1 change 13149436 branch on 2020/05/04 by Ben.Marsh@Ben.Marsh_T3245_UE5 (binary+l) 'Merging from //UE4/Private-Star'
+        # ... ... moved into //UE5/Main/GuidedTut/Square.png#1
+        # ... ... branch into //UE5/RES/Tut/Square.png#1
+
+        # $ p4 filelog -m2 //UE5/RES/Tut/Square.png#2
+        # //UE5/RES/Tut/Square.png
+        # ... #2 change 19027676 branch on 2022/02/16 by Marc.Audy@Marc.Audy_UE5_RES (binary+l) 'Update RES f'
+        # ... ... branch from //UE5/Main/Tut/Square.png#3
+        # ... #1 change 13667922 branch on 2020/06/11 by Marc.Audy@Marc.Audy_Z2487 (binary+l) 'Initial branch of files from Ma'
+        # ... ... branch from //UE5/Main/Tut/Square.png#1
+        # ... ... moved into //UE5/RES/GuidedTut/Square.png#1
+
+        # $ p4 filelog -m1 //UE5/RES/GuidedTut/Square.png#1
+        # //UE5/RES/GuidedTut/Square.png
+        # ... #1 change 19027676 move/add on 2022/02/16 by Marc.Audy@Marc.Audy_UE5_RES (binary+l) 'Update RES f'
+        # ... ... copy from //UE5/Main/GuidedTut/Square.png#1
+        # ... ... moved from //UE5/RES/Tut/Square.png#1
+
+        # add A1
+        # branch A1 B1
+        # branch A1 C1
+        # move A1 A2
+        # add A1
+        # copy A... B...
+
+        inside = localDirectory(self.source.client_root, "inside")
+        mfile1 = os.path.join(inside, "main", "file1")
+        mfile2 = os.path.join(inside, "main", "file2")
+        rfile1 = os.path.join(inside, "rel", "file1")
+
+        create_file(mfile1, "Test content")
+        self.source.p4cmd('add', mfile1)
+        self.source.p4cmd('submit', '-d', 'mfile1 added')
+
+        self.source.p4cmd('integ', mfile1, rfile1)
+        self.source.p4cmd('submit', '-d', 'mfile1 and rfile1 added')
+
+        self.source.p4cmd('edit', mfile1)
+        self.source.p4cmd('move', mfile1, mfile2)
+        self.source.p4cmd('submit', '-d', 'mfile2 added')
+
+        create_file(mfile1, "Test content2")
+        self.source.p4cmd('add', mfile1)
+        self.source.p4cmd('submit', '-d', 'mfile1 added back')
+
+        self.source.p4cmd('copy', "//depot/inside/main/...", "//depot/inside/rel/...")
+        self.source.p4cmd('submit', '-d', 'mfile1 added back')
+
+        filelogs = self.source.p4.run_filelog("@=5")
+        self.logger.debug(filelogs)
+        self.assertEqual(3, len(filelogs))
+        self.assertEqual(1, len(filelogs[0].revisions[0].integrations))
+        self.assertEqual("branch from", filelogs[0].revisions[0].integrations[0].how)
+        self.assertEqual(2, len(filelogs[1].revisions[0].integrations))
+        self.assertEqual("copy from", filelogs[1].revisions[0].integrations[0].how)
+        self.assertEqual("moved from", filelogs[1].revisions[0].integrations[1].how)
+
+        self.run_P4Transfer()
+        self.assertCounters(5, 5)
+
+        filelogs = self.target.p4.run_filelog("@=5")
+        self.logger.debug(filelogs)
+        self.assertEqual(3, len(filelogs))
+        self.assertEqual(1, len(filelogs[0].revisions[0].integrations))
+        self.assertEqual("branch from", filelogs[0].revisions[0].integrations[0].how)
+        self.assertEqual(2, len(filelogs[1].revisions[0].integrations))
+        self.assertEqual("copy from", filelogs[1].revisions[0].integrations[0].how)
+        self.assertEqual("moved from", filelogs[1].revisions[0].integrations[1].how)
+
     def testIntegCopyAndRename(self):
         """Test for integrating a copy and move into single target."""
         self.setupTransfer()
@@ -3515,7 +3831,7 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "copy from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "moved from")
 
-        # We can't move onto 
+        # We can't move onto
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
         # @pv@ 0 @db.integed@ @//stream/main/file1@ @//stream/main/file3@ 0 1 0 1 10 5
@@ -3579,7 +3895,7 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "moved from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "copy from")
 
-        # We can't move onto 
+        # We can't move onto
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
         # @pv@ 0 @db.integed@ @//stream/main/file1@ @//stream/main/file3@ 0 1 0 1 10 5
@@ -3739,8 +4055,8 @@ class TestP4Transfer(unittest.TestCase):
         recs = self.dumpDBFiles("db.integed")
         self.logger.debug(recs)
 
-        # @pv@ 0 @db.integed@ @//depot/inside/file3@ @//depot/outside/file5@ 1 2 0 1 6 3 
-        # @pv@ 0 @db.integed@ @//depot/outside/file5@ @//depot/inside/file3@ 0 1 1 2 10 3 
+        # @pv@ 0 @db.integed@ @//depot/inside/file3@ @//depot/outside/file5@ 1 2 0 1 6 3
+        # @pv@ 0 @db.integed@ @//depot/outside/file5@ @//depot/inside/file3@ 0 1 1 2 10 3
 
         # Convert copy from -> merged from
         newrecs = []
@@ -4004,6 +4320,67 @@ class TestP4Transfer(unittest.TestCase):
         self.logger.debug(filelog)
         self.assertEqual(1, len(filelog.revisions[0].integrations))
         self.assertEqual("copy from", filelog.revisions[0].integrations[0].how)
+
+    def testBranchAndMoveSameTarget(self):
+        """Branch a file and move/rename into same revision."""
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+        inside_file2 = os.path.join(inside, "inside_file2")
+        inside_file3 = os.path.join(inside, "inside_file3")
+        create_file(inside_file1, "Test content")
+        self.source.p4cmd('add', inside_file1)
+        self.source.p4cmd('submit', '-d', 'inside_file1 added')
+
+        self.source.p4cmd('integrate', inside_file1, inside_file2)
+        self.source.p4cmd('submit', '-d', 'branch original')
+
+        self.source.p4cmd('edit', inside_file1)
+        self.source.p4cmd('move', inside_file1, inside_file3)
+        self.source.p4cmd('integ', '-f', inside_file2, inside_file3)
+        self.source.p4cmd('resolve', '-at')
+        self.source.p4cmd('submit', '-d', 'branch and move')
+
+        filelog = self.source.p4.run_filelog(inside_file3)[0]
+        self.logger.debug(filelog)
+        self.assertEqual(2, len(filelog.revisions[0].integrations), 2)
+        self.assertEqual("moved from", filelog.revisions[0].integrations[0].how)
+        self.assertEqual("copy from", filelog.revisions[0].integrations[1].how)
+
+        # Convert copy from to branch from
+        recs = self.dumpDBFiles("db.integed")
+        self.logger.debug(recs)
+
+        #  '@pv@ 1 @db.integed@ @//depot/inside/inside_file2@ @//depot/inside/inside_file3@ 0 1 0 1 10 3 ', 
+        #  '@pv@ 1 @db.integed@ @//depot/inside/inside_file3@ @//depot/inside/inside_file2@ 0 1 0 1 4 3 ']
+        newrecs = []
+        for rec in recs:
+            if "@db.integed@ @//depot/inside/inside_file2@ @//depot/inside/inside_file3@" in rec:
+                rec = rec.replace("@ 0 1 0 1 10", "@ 0 1 0 1 3")     # 10->3: edit into->branch into
+                rec = rec.replace("@pv@", "@rv@")
+                newrecs.append(rec)
+            if "@db.integed@ @//depot/inside/inside_file3@ @//depot/inside/inside_file2@" in rec:
+                rec = rec.replace("@ 0 1 0 1 4", "@ 0 1 0 1 2")     # 4->2: copy from->branch from
+                rec = rec.replace("@pv@", "@rv@")
+                newrecs.append(rec)
+        self.logger.debug("Newrecs:", "\n".join(newrecs))
+        self.applyJournalPatch("\n".join(newrecs))
+
+        filelog = self.source.p4.run_filelog(inside_file3)[0]
+        self.logger.debug(filelog)
+        self.assertEqual(2, len(filelog.revisions[0].integrations), 2)
+        self.assertEqual("moved from", filelog.revisions[0].integrations[0].how)
+        self.assertEqual("branch from", filelog.revisions[0].integrations[1].how)
+
+        self.run_P4Transfer()
+        self.assertCounters(3, 3)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file3')[0]
+        self.logger.debug(filelog)
+        self.assertEqual(2, len(filelog.revisions[0].integrations))
+        self.assertEqual("moved from", filelog.revisions[0].integrations[0].how)
+        self.assertEqual("copy from", filelog.revisions[0].integrations[1].how)
 
     def testIntegAddMergeCopy(self):
         """Integrate an add/merge/copy of 3 revisions into single new target."""
@@ -4533,6 +4910,28 @@ class TestP4Transfer(unittest.TestCase):
         files = self.target.p4cmd('files', "//depot/import/file1")
         self.assertEqual(files[0]['type'], "text")
 
+    def testResetConnection(self):
+        "Reset connection - for flaky connections"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+
+        files = []
+        for f in range(1, 5):
+            fname = "file{}".format(f)
+            files.append(os.path.join(inside, fname))
+
+        for fname in files:
+            create_file(fname, 'Test content')
+            self.source.p4cmd('add', fname)
+
+        self.source.p4cmd('submit', '-d', 'File(s) added')
+
+        self.run_P4Transfer("--reset-connection", "2")
+
+        newFiles = self.target.p4cmd('files', "//...")
+        self.assertEqual(len(newFiles), 4)
+
     def testTempobjFiletype(self):
         """Tests for files with no content"""
         self.setupTransfer()
@@ -4582,6 +4981,73 @@ class TestP4Transfer(unittest.TestCase):
         filelog = self.target.p4.run_filelog('//depot/import/inside_file4')
         self.assertEqual(filelog[0].revisions[0].action, 'integrate')
         self.assertEqual(filelog[0].revisions[1].action, 'purge')
+
+    def testAddAfterPurge(self):
+        """Tests for files added after being purged"""
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+
+        create_file(inside_file1, "Test content")
+        self.source.p4cmd('add', '-t', 'text', inside_file1)
+        self.source.p4cmd('submit', '-d', 'files added')
+
+        self.source.p4cmd('sync', '@0')
+        self.source.p4cmd('obliterate', '-yp', inside_file1)
+
+        self.source.p4cmd('add', inside_file1)
+        append_to_file(inside_file1, 'New text')
+        self.source.p4cmd('submit', '-d', 'version 2')
+
+        self.run_P4Transfer()
+        self.assertCounters(2, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        revisions = filelog[0].revisions
+        self.logger.debug('test:', revisions)
+        self.assertEqual(len(revisions), 2)
+        for rev in revisions:
+            self.logger.debug('test:', rev.rev, rev.action, rev.digest)
+            self.logger.debug(self.target.p4.run_print('//depot/import/inside_file1#%s' % rev.rev))
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual(filelog[0].revisions[0].action, 'edit')
+        self.assertEqual(filelog[0].revisions[1].action, 'add')
+
+    def testBranchUndoAfterPurge(self):
+        """Tests for files branched ontop of purged revs"""
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        inside_file1 = os.path.join(inside, "inside_file1")
+
+        create_file(inside_file1, "Test content")
+        self.source.p4cmd('add', '-t', 'text', inside_file1)
+        self.source.p4cmd('submit', '-d', 'files added')
+
+        self.source.p4cmd('edit', inside_file1)
+        append_to_file(inside_file1, 'New text')
+        self.source.p4cmd('submit', '-d', 'version 2')
+
+        self.source.p4cmd('sync', '@0')
+        self.source.p4cmd('obliterate', '-yp', f'{inside_file1}#2')
+
+        self.source.p4cmd('copy', f'{inside_file1}#1', inside_file1)
+        self.source.p4cmd('submit', '-d', 'branch/undo')
+
+        self.run_P4Transfer()
+        self.assertCounters(3, 3)
+
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        revisions = filelog[0].revisions
+        self.logger.debug('test:', revisions)
+        self.assertEqual(len(revisions), 3)
+        for rev in revisions:
+            self.logger.debug('test:', rev.rev, rev.action, rev.digest)
+            self.logger.debug(self.target.p4.run_print('//depot/import/inside_file1#%s' % rev.rev))
+        filelog = self.target.p4.run_filelog('//depot/import/inside_file1')
+        self.assertEqual(filelog[0].revisions[0].action, 'integrate')
+        self.assertEqual(filelog[0].revisions[1].action, 'edit')
 
     def testBranchPerformance(self):
         "Branch lots of files and test performance"
@@ -4891,11 +5357,11 @@ class TestP4Transfer(unittest.TestCase):
                                    'targ': '//targ_streams/main',
                                    'type': 'mainline',
                                    'parent': ''},
-                                   {'src': '//src_streams/rel1',
+                                  {'src': '//src_streams/rel1',
                                    'targ': '//targ_streams/rel1',
                                    'type': 'release',
                                    'parent': '//targ_streams/main'},
-                                   {'src': '//src_streams/rel2',
+                                  {'src': '//src_streams/rel2',
                                    'targ': '//targ_streams/rel2',
                                    'type': 'release',
                                    'parent': '//targ_streams/main'}]
