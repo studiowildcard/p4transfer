@@ -184,7 +184,7 @@ class ArgLogger(logging.getLoggerClass()):
 
     def report_exception(self):
         "Notify users that we have had a problem"
-        self.notify("Exception in %s" % self.instance_name, "", use_log=True)
+        self.notify("Exception in %s" % self.instance_name, "", include_log=True)
 
     def notify(self, subject, body, include_output=True, include_log=False):
         "Notify users of a message"
@@ -199,7 +199,7 @@ class ArgLogger(logging.getLoggerClass()):
             self.saved_output = []
         if self.mail_form_url:
             return notify_users_by_form(self.mail_form_url, subject, body)
-        else:
+        if self.mail_server and self.mail_from and self.mail_to:
             notify_users_by_email(self.mail_from, self.mail_to, self.mail_server, subject, body)
 
 

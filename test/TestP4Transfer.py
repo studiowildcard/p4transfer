@@ -305,12 +305,17 @@ class TestP4Transfer(unittest.TestCase):
             yaml.dump(config, f)
 
     def run_P4Transfer(self, *args):
+        self.logger.debug("-----------------------------Starting P4Transfer")
         base_args = ['-c', self.transfer_cfg, '-s']
         if args:
             base_args.extend(args)
         pt = P4Transfer.P4Transfer(*base_args)
         result = pt.replicate()
         return result
+
+    def setTargetCounter(self, value):
+        "Set's the target counter to specified value"
+        self.target.p4.run('counter', TEST_COUNTER_NAME, str(value))
 
     def assertCounters(self, sourceValue, targetValue):
         sourceCounter = self.target.getCounter()
@@ -1245,7 +1250,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "adding original file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('submit', '-d', "renaming file")
 
         self.source.p4cmd('obliterate', '-y', "%s#1" % original_file)
@@ -1265,7 +1270,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "adding original file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('submit', '-d', "renaming file")
 
         self.source.p4cmd('obliterate', '-y', original_file)
@@ -1285,7 +1290,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "adding original file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('submit', '-d', "renaming file")
 
         self.run_P4Transfer()
@@ -1303,7 +1308,7 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(change['action'][1], 'move/delete')
 
         self.source.p4cmd('edit', renamed_file)
-        self.source.p4.run_move(renamed_file, original_file)
+        self.source.p4cmd('move', renamed_file, original_file)
         self.source.p4cmd('submit', '-d', "renaming file back")
 
         self.run_P4Transfer()
@@ -1325,7 +1330,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "adding original file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('integ', '-f', other_file, renamed_file)
         self.source.p4cmd('resolve', '-at')
         self.source.p4cmd('submit', '-d', "renaming file with copy")
@@ -1359,7 +1364,7 @@ class TestP4Transfer(unittest.TestCase):
     #     self.source.p4cmd('submit', '-d', "editing original file")
     #
     #     self.source.p4cmd('edit', original_file)
-    #     self.source.p4.run_move(original_file, renamed_file)
+    #     self.source.p4cmd('move', original_file, renamed_file)
     #     self.source.p4cmd('submit', '-d', "renaming file")
     #
     #     # Now we partially transfer
@@ -1384,7 +1389,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "adding original file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('submit', '-d', "renaming file")
 
         self.run_P4Transfer()
@@ -1402,7 +1407,7 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(change['action'][1], 'move/delete')
 
         self.source.p4cmd('edit', renamed_file)
-        self.source.p4.run_move(renamed_file, original_file)
+        self.source.p4cmd('move', renamed_file, original_file)
         self.source.p4cmd('submit', '-d', "renaming file back")
 
         self.run_P4Transfer()
@@ -1418,7 +1423,7 @@ class TestP4Transfer(unittest.TestCase):
         # Now move inside to outside
         outside_file = os.path.join(outside, 'outside_file')
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, outside_file)
+        self.source.p4cmd('move', original_file, outside_file)
         self.source.p4cmd('submit', '-d', "moving file outside")
 
         self.run_P4Transfer()
@@ -1431,7 +1436,7 @@ class TestP4Transfer(unittest.TestCase):
 
         # Now move outside to inside
         self.source.p4cmd('edit', outside_file)
-        self.source.p4.run_move(outside_file, original_file)
+        self.source.p4cmd('move', outside_file, original_file)
         self.source.p4cmd('submit', '-d', "moving file from outside back to inside")
 
         self.run_P4Transfer()
@@ -1441,6 +1446,43 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(len(change['depotFile']), 1)
         self.assertEqual(change['depotFile'][0], '//depot/import/original/original_file')
         self.assertEqual(change['action'][0], 'add')
+
+    def testMoveCopyCombo(self):
+        """Test for Move where the add also has a copy"""
+        self.setupTransfer()
+        inside = localDirectory(self.source.client_root, "inside")
+        original_file = os.path.join(inside, 'original', 'original_file')
+        renamed_file = os.path.join(inside, 'new', 'new_file')
+        file2 = os.path.join(inside, 'new', 'file2')
+        create_file(original_file, "Some content\n")
+        create_file(file2, "Other content\n")
+        self.source.p4cmd('add', original_file, file2)
+        self.source.p4cmd('submit', '-d', "adding original files")
+
+        self.source.p4cmd('edit', original_file)
+        append_to_file(original_file, 'More\n')
+        self.source.p4cmd('submit', '-d', "editing original file")
+
+        self.source.p4cmd('edit', original_file)
+        self.source.p4cmd('move', original_file, renamed_file)
+        self.source.p4cmd('integ', file2, renamed_file)
+        self.source.p4cmd('resolve', '-at', renamed_file)
+        self.source.p4cmd('submit', '-d', "renaming and copying file")
+
+        self.run_P4Transfer()
+        self.assertCounters(3, 3)
+
+        change = self.target.p4.run_describe('3')[0]
+        self.assertEqual(2, len(change['depotFile']))
+        self.assertEqual('//depot/import/new/new_file', change['depotFile'][0])
+        self.assertEqual('//depot/import/original/original_file', change['depotFile'][1])
+        self.assertEqual('move/add', change['action'][0])
+        self.assertEqual('move/delete', change['action'][1])
+        filelog = self.target.p4.run_filelog('//depot/import/new/new_file')
+        self.assertEqual(2, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("copy from", filelog[0].revisions[0].integrations[0].how)
+        self.assertEqual("moved from", filelog[0].revisions[0].integrations[1].how)
+
 
     def testOldStyleMove(self):
         """Old style move - a branch and delete"""
@@ -1489,7 +1531,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "branching file")
 
         self.source.p4cmd('edit', original_file)
-        self.source.p4.run_move(original_file, renamed_file)
+        self.source.p4cmd('move', original_file, renamed_file)
         self.source.p4cmd('submit', '-d', "renaming file")
 
         self.source.p4cmd('integrate', '//depot/inside/main/...', '//depot/inside/branch/...')
@@ -1497,7 +1539,7 @@ class TestP4Transfer(unittest.TestCase):
         self.source.p4cmd('submit', '-d', "branching rename and rename back file")
 
         self.source.p4cmd('edit', renamed_file)
-        self.source.p4.run_move(renamed_file, original_file)
+        self.source.p4cmd('move', renamed_file, original_file)
         self.source.p4cmd('submit', '-d', "renaming file back")
 
         # Copy the individual move/add and move/delete files, which become add and delete like this
@@ -1845,6 +1887,489 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(len(filelog[0].revisions), 4)
         self.assertEqual(len(filelog[0].revisions[1].integrations), 1)
         self.assertEqual(filelog[0].revisions[0].integrations[0].how, "copy from")
+
+    def testHistoricalStartSimple(self):
+        "Simple integration options for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        contents = ["0"] * 10
+        contents2 = contents[:]
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        file2 = os.path.join(inside, "file2")
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('submit', '-d', '2: file1 -> file2')
+
+        self.source.p4cmd('edit', file1)
+        self.source.p4cmd('edit', file2)
+        contents[0] = "file1"
+        create_file(file1, "\n".join(contents) + "\n")
+        contents2[5] = "file2"
+        create_file(file2, "\n".join(contents2) + "\n")
+        self.source.p4cmd('submit', '-d', '3: file1 edited')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4.run_resolve('-am')
+        self.source.p4cmd('submit', '-d', '4: file1 -> file2 (merge)')
+
+        filelog = self.source.p4.run_filelog('//depot/inside/file2')
+        self.assertEqual("merge from", filelog[0].revisions[0].integrations[0].how)
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '4'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 1)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(0, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("add", filelog[0].revisions[0].action)
+
+    def testHistoricalStartSimple2(self):
+        "Simple integration options for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        contents = ["0"] * 10
+        contents2 = contents[:]
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', 'file1 added')
+
+        file2 = os.path.join(inside, "file2")
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('submit', '-d', 'file1 -> file2')
+
+        self.source.p4cmd('edit', file1)
+        self.source.p4cmd('edit', file2)
+        contents[0] = "file1"
+        create_file(file1, "\n".join(contents) + "\n")
+        contents2[5] = "file2"
+        create_file(file2, "\n".join(contents2) + "\n")
+        self.source.p4cmd('submit', '-d', 'file1 edited')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4.run_resolve('-am')
+        self.source.p4cmd('submit', '-d', 'file1 -> file2 (merge)')
+
+        filelog = self.source.p4.run_filelog('//depot/inside/file2')
+        self.assertEqual("merge from", filelog[0].revisions[0].integrations[0].how)
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '3'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("integrate", filelog[0].revisions[0].action)
+        self.assertEqual("add", filelog[0].revisions[1].action)
+
+    def testHistoricalRename(self):
+        "Rename for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        file2 = os.path.join(inside, "file2")
+        contents = ["0"] * 10
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        self.source.p4cmd('edit', file1)
+        contents[0] = "file1"
+        self.source.p4cmd('submit', '-d', '2: file1 edit')
+
+        chg = self.source.p4.fetch_change()
+        chg._description = "Test desc"
+        self.source.p4.save_change(chg)
+
+        self.source.p4cmd('edit', file1)
+        self.source.p4cmd('move', file1, file2)
+        self.source.p4cmd('submit', '-d', '4: file1 renamed to file2')
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '3'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/add", filelog[0].revisions[0].action)
+
+        self.source.p4cmd('edit', file2)
+        self.source.p4cmd('move', file2, file1)
+        self.source.p4cmd('submit', '-d', '5: renamed back')
+
+        self.run_P4Transfer()
+        self.assertCounters(5, 3)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(0, len(filelog[0].revisions[0].integrations))
+        self.assertEqual(2, len(filelog[0].revisions[1].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/delete", filelog[0].revisions[0].action)
+        self.assertEqual("move/add", filelog[0].revisions[1].action)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file1')
+        self.assertEqual(3, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual(1, len(filelog[0].revisions[2].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/add", filelog[0].revisions[0].action)
+
+    def testHistoricalAddDelete(self):
+        "Old style rename for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        file2 = os.path.join(inside, "file2")
+        file3 = os.path.join(inside, "file3")
+        contents = ["0"] * 10
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        self.source.p4cmd('integ', file1, file2)
+        self.source.p4cmd('submit', '-d', '2: file1 -> file2')
+
+        chg = self.source.p4.fetch_change()
+        chg._description = "Test desc"
+        self.source.p4.save_change(chg)
+
+        self.source.p4cmd('integ', file2, file3)
+        self.source.p4cmd('delete', file2)
+        self.source.p4cmd('submit', '-d', '4: file2 delete/copy')
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '3'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(0, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("delete", filelog[0].revisions[0].action)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file3')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("branch", filelog[0].revisions[0].action)
+
+    def testHistoricalRenameAdd(self):
+        "Rename with subsequent add for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        file2 = os.path.join(inside, "file2")
+        file3 = os.path.join(inside, "file3")
+        contents = ["0"] * 10
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        self.source.p4cmd('edit', file1)
+        contents[0] = "file1"
+        self.source.p4cmd('submit', '-d', '2: file1 edit')
+
+        chg = self.source.p4.fetch_change()
+        chg._description = "Test desc"
+        self.source.p4.save_change(chg)
+
+        self.source.p4cmd('edit', file1)
+        self.source.p4cmd('move', file1, file2)
+        self.source.p4cmd('submit', '-d', '4: file1 renamed to file2')
+
+        create_file(file3, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file3)
+        self.source.p4cmd('submit', '-d', '5: add file3')
+
+        self.source.p4cmd('edit', file3)
+        self.source.p4cmd('move', file3, file1)
+        self.source.p4cmd('submit', '-d', '6: rename 3->1')
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '3'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(6, 4)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/add", filelog[0].revisions[0].action)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file3')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(0, len(filelog[0].revisions[0].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/delete", filelog[0].revisions[0].action)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file1')
+        self.assertEqual(3, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual(1, len(filelog[0].revisions[2].integrations))
+        # self.assertEqual(0, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("move/add", filelog[0].revisions[0].action)
+
+    def testHistoricalStartMerge(self):
+        "Merge for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        contents = ["0"] * 10
+        contents2 = contents[:]
+        create_file(file1, "\n".join(contents) + "\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        file2 = os.path.join(inside, "file2")
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('submit', '-d', '2: file1 -> file2')
+
+        self.source.p4cmd('edit', file1)
+        self.source.p4cmd('edit', file2)
+        contents[0] = "file1"
+        create_file(file1, "\n".join(contents) + "\n")
+        contents2[5] = "file2"
+        create_file(file2, "\n".join(contents2) + "\n")
+        self.source.p4cmd('submit', '-d', '3: file1&2 edited')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4.run_resolve('-am')
+        self.source.p4cmd('submit', '-d', '4: file1 -> file2 (merge)')
+
+        filelog = self.source.p4.run_filelog('//depot/inside/file2')
+        self.assertEqual("merge from", filelog[0].revisions[0].integrations[0].how)
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '4'
+        self.createConfigFile(options=config)
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 1)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(0, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("add", filelog[0].revisions[0].action)
+
+        self.source.p4cmd('integrate', file2, file1)
+        self.source.p4.run_resolve('-am')
+        self.source.p4cmd('submit', '-d', '5: file2 -> file1 (merge)')
+
+        self.run_P4Transfer()
+        self.assertCounters(5, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file1')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("integrate", filelog[0].revisions[0].action)
+
+    def testHistoricalStartSimple3(self):
+        "Simple integration options for historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        create_file(file1, "Test content\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        file2 = os.path.join(inside, "file2")
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('submit', '-d', '2: file1 -> file2')
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '3'
+        self.createConfigFile(options=config)
+
+        self.source.p4cmd('edit', file1)
+        append_to_file(file1, "Rev2 chg3\n")
+        self.source.p4cmd('submit', '-d', '3: file1 edited')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4.run_resolve('-at')
+        self.source.p4cmd('submit', '-d', '4: file1 -> file2 (copy rev2)')
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 2)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("integrate", filelog[0].revisions[0].action)
+        self.assertEqual("add", filelog[0].revisions[1].action)
+
+        self.logger.debug("========================================== Incremental change")
+        # Now make 2 changes and integrate them one at a time.
+        self.source.p4cmd('edit', file1)
+        append_to_file(file1, "Rev3 chg5\n")
+        self.source.p4cmd('submit', '-d', '5: file1 edited')
+
+        self.source.p4cmd('edit', file1)
+        append_to_file(file1, "Rev4 chg6\n")
+        self.source.p4cmd('submit', '-d', '6: file1 edited')
+
+        self.source.p4cmd('integrate', file1 + "#3", file2)
+        self.source.p4.run_resolve('-at')
+        self.source.p4cmd('submit', '-d', '7: file1 -> file2 (copy rev3)')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4.run_resolve('-at')
+        self.source.p4cmd('submit', '-d', '8: file1 -> file2 (copy rev4)')
+
+        self.run_P4Transfer()
+        self.assertCounters(8, 6)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        # self.logger.debug(filelog)
+        self.assertEqual(4, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("copy from", filelog[0].revisions[0].integrations[0].how)
+        self.assertEqual("copy from", filelog[0].revisions[1].integrations[0].how)
+        self.assertEqual("copy from", filelog[0].revisions[2].integrations[0].how)
+        self.assertEqual("add", filelog[0].revisions[3].action)
+
+    def testHistoricalSubsequentMerge(self):
+        "Integration after historical start mode transfer"
+        self.setupTransfer()
+
+        inside = localDirectory(self.source.client_root, "inside")
+        file1 = os.path.join(inside, "file1")
+        file2 = os.path.join(inside, "file2")
+        file3 = os.path.join(inside, "file3")
+        create_file(file1, "Test content\n")
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '1: file1 added')
+
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '2'
+        self.createConfigFile(options=config)
+
+        create_file(file2, "Test content2\n")
+        self.source.p4cmd('add', file2)
+        self.source.p4cmd('submit', '-d', '2: file2 added')
+
+        self.source.p4cmd('integrate', file2, file3)
+        self.source.p4cmd('submit', '-d', '3: file2 -> file3')
+
+        self.source.p4cmd('edit', file2)
+        append_to_file(file2, "More\n")
+        self.source.p4cmd('submit', '-d', '4: file2 edited')
+
+        self.source.p4cmd('integrate', file2, file3)
+        self.source.p4cmd('resolve', "-as")
+        self.source.p4cmd('submit', '-d', '5: file2 -> file3')
+
+        self.run_P4Transfer()
+        self.assertCounters(5, 4)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("edit", filelog[0].revisions[0].action)
+        self.assertEqual("add", filelog[0].revisions[1].action)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file3')
+        self.assertEqual(2, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual(1, len(filelog[0].revisions[1].integrations))
+        self.assertEqual("copy from", filelog[0].revisions[0].integrations[0].how)
+        self.assertEqual("branch from", filelog[0].revisions[1].integrations[0].how)
+
+    def testHistoricalTooManyTargetRevs(self):
+        "Historical integration where target has extra revs so wrong one is picked"
+        self.setupTransfer()
+
+        _ = self.source.p4.fetch_change() # Create change no
+        # In HistoricalStart mode we don't start from first change
+        config = self.getDefaultOptions()
+        config['historical_start_change'] = '2'
+        self.createConfigFile(options=config)
+        self.setTargetCounter('1')
+        
+        inside = localDirectory(self.source.client_root, "inside")
+        timport = localDirectory(self.target.client_root, "import")
+        file1 = os.path.join(inside, "file1")
+        file2 = os.path.join(inside, "file2")
+        tfile1 = os.path.join(timport, "file1")
+        tfile2 = os.path.join(timport, "file2")
+        
+        create_file(file1, "Test content\n")
+        create_file(tfile1, "Test targ content\n")
+
+        # Add pre-existing target files
+        self.target.p4cmd('add', tfile1)
+        self.target.p4cmd('submit', '-d', '1: file1 added')
+
+        self.target.p4cmd('integrate', tfile1, tfile2)
+        self.target.p4cmd('submit', '-d', '2: file1 -> file2')
+
+        self.target.p4cmd('delete', tfile1, tfile2)
+        self.target.p4cmd('submit', '-d', '3: delete both')
+
+        # Now source files we want to replicate
+        self.source.p4cmd('add', file1)
+        self.source.p4cmd('submit', '-d', '2: file1 added')
+
+        self.run_P4Transfer()
+        self.assertCounters(2, 4)
+
+        self.target.p4cmd('obliterate', '-y', '@1,3')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('submit', '-d', '3: file1 -> file2')
+
+        self.source.p4cmd('edit', file1)
+        append_to_file(file1, "More again\n")
+        self.source.p4cmd('submit', '-d', '4: file1 edited')
+
+        self.source.p4cmd('integrate', file1, file2)
+        self.source.p4cmd('resolve', "-as")
+        self.source.p4cmd('submit', '-d', '5: file1 -> file2')
+
+        self.run_P4Transfer()
+        self.assertCounters(4, 6)
+
+        filelog = self.target.p4.run_filelog('//depot/import/file2')
+        self.assertEqual(1, len(filelog[0].revisions))
+        self.assertEqual(1, len(filelog[0].revisions[0].integrations))
+        self.assertEqual("branch", filelog[0].revisions[0].action)
 
     def testComplexIntegrate(self):
         "More complex integrations with various resolve options"
@@ -3174,7 +3699,6 @@ class TestP4Transfer(unittest.TestCase):
         self.assertEqual(filelog.revisions[0].integrations[0].how, "copy from")
         self.assertEqual(filelog.revisions[0].integrations[1].how, "moved from")
 
-
     def testIntegCopyAndRenameAsAddFromOutside(self):
         """Test for integrating a copy and move into single target - when copy is from outside view."""
         self.setupTransfer()
@@ -4089,7 +4613,7 @@ class TestP4Transfer(unittest.TestCase):
 
         inside_file2 = os.path.join(inside, "inside_file2")
         self.source.p4cmd('edit', inside_file1)
-        self.source.p4.run_move(inside_file1, inside_file2)
+        self.source.p4cmd('move', inside_file1, inside_file2)
         self.source.p4cmd('submit', '-d', 'moved inside_file1 to inside_file2')
 
         self.source.p4.run_sync('-f', '%s#1' % inside_file1)
