@@ -205,6 +205,8 @@ error_report_interval: 15
 # summary_report_interval (Integer): Interval (in minutes) between summary emails being sent e.g. changes processed
 #     Typically some value such as 1 week (10080 = 7 * 24 * 60). Useful if transfer being run with --repeat option.
 summary_report_interval: "7 * 24 * 60"
+                           
+report_sync_progress: true
 
 # sync_progress_size_interval (Integer): Size in bytes controlling when syncs are reported to log file.
 #    Useful for keeping an eye on progress for large syncs over slow network links.
@@ -481,6 +483,8 @@ def diskFileContentModified(file):
             fileSize = os.path.getsize(file.fixedLocalFile)
             digest = getLocalDigest(file.fixedLocalFile)
     elif fileContentComparisonPossible(file.type):
+        if not os.path.exists(file.fixedLocalFile):
+           print(f'file missing but shouldn\'t be: {file.fixedLocalFile}')
         fileSize = os.path.getsize(file.fixedLocalFile)
         digest = getLocalDigest(file.fixedLocalFile)
     elif isKeyTextFile(file.type):
@@ -759,18 +763,25 @@ class ReportProgress(object):
         self.changesSynced = 0
         self.sizeSynced = 0
         self.previousSizeSynced = 0
+        self.report_sync_progress = None
         self.sync_progress_size_interval = None     # Set to integer value to get reports
         self.logger.info("Syncing %d changes" % (len(changes)))
         self.logger.info("Finding change sizes")
         self.changeSizes = {}
-        for chg in changes:
-            sizes = p4.run('sizes', '-s', '//%s/...@%s,%s' % (workspace, chg['change'], chg['change']))
-            fcount = int(sizes[0]['fileCount'])
-            fsize = int(sizes[0]['fileSize'])
-            self.sizeToSync += fsize
-            self.filesToSync += fcount
-            self.changeSizes[chg['change']] = (fcount, fsize)
-        self.logger.info("Syncing filerevs %d, size %s" % (self.filesToSync, fmtsize(self.sizeToSync)))
+        if self.report_sync_progress:
+            for chg in changes:
+                sizes = p4.run('sizes', '-s', '//%s/...@%s,%s' % (workspace, chg['change'], chg['change']))
+                fcount = int(sizes[0]['fileCount'])
+                fsize = int(sizes[0]['fileSize'])
+                self.sizeToSync += fsize
+                self.filesToSync += fcount
+                self.changeSizes[chg['change']] = (fcount, fsize)
+            self.logger.info("Syncing filerevs %d, size %s" % (self.filesToSync, fmtsize(self.sizeToSync)))
+        else:
+            self.logger.info("Sync progress reporting disabled. Change in options if desired.")
+
+    def SetReportSyncProgress(self, report):
+        self.report_sync_progress = report
 
     def SetSyncProgressSizeInterval(self, interval):
         "Set appropriate"
@@ -787,8 +798,8 @@ class ReportProgress(object):
             return
         if self.sizeSynced > self.previousSizeSynced + self.sync_progress_size_interval:
             self.previousSizeSynced = self.sizeSynced
-            syncPercent = 100 * float(self.filesSynced) / float(self.filesToSync)
-            sizePercent = 100 * float(self.sizeSynced) / float(self.sizeToSync)
+            syncPercent = 100 * float(self.filesSynced) / float(self.filesToSync) if self.report_sync_progress else 0
+            sizePercent = 100 * float(self.sizeSynced) / float(self.sizeToSync) if self.report_sync_progress else 0
             self.logger.info("Synced %d/%d changes, files %d/%d (%2.1f %%), size %s/%s (%2.1f %%)" % (
                     self.changesSynced, self.changesToSync,
                     self.filesSynced, self.filesToSync, syncPercent,
@@ -974,6 +985,7 @@ class P4Base(object):
                 if 'SSL' in str(e):  
                     print(f"SSL connection error encountered: {e}. Retrying in {delay} seconds...")
                     time.sleep(delay)
+                    delay = pow(delay, 1.2)
                     retries += 1
                 else:
                     # If the error is not an SSL error, re-raise the exception
@@ -1087,7 +1099,7 @@ class P4Source(P4Base):
                         args.extend(['-m', self.options.maximum])
                     args.append(revRange)
                     self.logger.debug('reading changes: %s' % args)
-                    # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 40000000); see 'p4 help maxscanrows'."
+                    # TODO: Prevent failure here due to [Error]: "Too many rows scanned (over 50000000); see 'p4 help maxscanrows'."
                     changes = self.p4cmd(args)
                     self.logger.debug('found %d changes' % len(changes))
                 else:
@@ -1103,7 +1115,7 @@ class P4Source(P4Base):
                 self.logger.debug('processing %d changes' % len(changes))
                 success = True
             except P4.P4Exception as e:
-                re_resubmit = re.compile(r"Too many rows scanned \(over 40000000\); see \'p4 help maxscanrows\'\.")
+                re_resubmit = re.compile(r"Too many rows scanned \(over 50000000\); see \'p4 help maxscanrows\'\.")
                 m = re_resubmit.search(e.value)
                 if m:
                     if maxChanges == 1:
@@ -1710,6 +1722,8 @@ class P4Target(P4Base):
                     if added or (ind == 0 and outputDict and outputDict['action'] == 'branch' and
                                  self.integrateContentsChanged(file)):
                         if not edited:
+                            if not os.path.exists(file.localFile):
+                                print(f"File does not exist and it should {file.localFile}")
                             self.p4cmd('edit', file.localFile)
                         self.src.p4cmd('sync', '-f', file.localFileRev())
         else:
@@ -2118,6 +2132,7 @@ class P4Transfer(object):
                             help="Time to stop transfers, format: 'YYYY/MM/DD HH:mm' - useful"
                             " for automation runs during quiet periods e.g. run overnight but stop first thing in the morning")
         self.options = parser.parse_args(list(args))
+        self.options.report_sync_progress = None
         self.options.sync_progress_size_interval = None
 
         if self.options.sample_config:
@@ -2175,6 +2190,8 @@ class P4Transfer(object):
         self.options.report_interval = self.getIntOption(GENERAL_SECTION, "report_interval", 30)
         self.options.error_report_interval = self.getIntOption(GENERAL_SECTION, "error_report_interval", 30)
         self.options.summary_report_interval = self.getIntOption(GENERAL_SECTION, "summary_report_interval", 10080)
+        self.options.report_sync_progress = self.getIntOption(
+            GENERAL_SECTION, "report_sync_progress")
         self.options.sync_progress_size_interval = self.getIntOption(
             GENERAL_SECTION, "sync_progress_size_interval")
         self.options.max_logfile_size = self.getIntOption(GENERAL_SECTION, "max_logfile_size", 20 * 1024 * 1024)
@@ -2272,6 +2289,7 @@ class P4Transfer(object):
             self.target.initChangeMapFile()
             self.save_previous_target_change_counter()
             self.source.progress = ReportProgress(self.source.p4, changes, self.logger, self.source.P4CLIENT)
+            self.source.progress.SetReportSyncProgress(self.options.report_sync_progress)
             self.source.progress.SetSyncProgressSizeInterval(self.options.sync_progress_size_interval)
             self.checkRotateLogFile()
             self.revertOpenedFiles()
